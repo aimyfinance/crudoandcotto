@@ -1,0 +1,16 @@
+# systemd-юніт для VPS (Oracle Always Free / будь-який Linux):
+#   sudo cp crudo-bot.service /etc/systemd/system/ && sudo systemctl enable --now crudo-bot
+[Unit]
+Description=Crudo & Cotto Telegram accounting bot
+After=network-online.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/crudo_bot
+EnvironmentFile=/home/ubuntu/crudo_bot/.env
+ExecStart=/home/ubuntu/crudo_bot/.venv/bin/python -m bot.main
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
