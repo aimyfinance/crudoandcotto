@@ -34,6 +34,7 @@ class Sett(StatesGroup):
     db_file = State()
     cash_confirm = State()
     products_file = State()
+    opening_file = State()
 
 
 # ---------------- періоди ----------------
@@ -160,7 +161,7 @@ def settings_kb(user):
         rows += [[("➕ Додати користувача", "set:adduser")],
                  [("💾 Резервна копія зараз", "set:backup"), ("♻️ Відновити з файлу", "set:restore")],
                  [("🧾 Імпорт звіту каси", "set:cashimport")],
-                 [("📥 Імпорт товарів з файлу", "set:prodimport")]]
+                 [("📥 Імпорт товарів з файлу", "set:prodimport"), ("📥 Імпорт початкових залишків", "set:openimport")]]
     return inline(rows)
 
 
@@ -283,6 +284,37 @@ async def prod_import_file(msg: Message, state: FSMContext, user):
         return await msg.answer(f"⚠️ Не вдалося прочитати файл: {e}")
     await state.clear()
     txt = f"✅ Створено товарів: {created}\nПропущено (вже були): {skipped}"
+    if errors:
+        txt += "\n\n⚠️ Помилки:\n" + "\n".join(errors[:15])
+    await msg.answer(txt, reply_markup=main_menu(user["role"]))
+
+
+@router.callback_query(F.data == "set:openimport")
+async def open_import_start(cb: CallbackQuery, state: FSMContext, user):
+    if user["role"] != "admin":
+        return await cb.answer("Лише адміністратор", show_alert=True)
+    await state.set_state(Sett.opening_file)
+    await cb.message.answer(
+        "📥 Надішліть файл початкових залишків (CSV або Excel) з колонками:\n"
+        "<code>name; kg; price_per_kg; expiry</code>\n"
+        "name — точна назва товару як у боті; kg — фактичний залишок; price_per_kg — закупівельна ціна; "
+        "expiry — термін придатності (необов'язково).\n⚠️ Кожне надсилання додає нові партії — надсилайте один раз.",
+        reply_markup=nav_kb(back=False))
+    await cb.answer()
+
+
+@router.message(StateFilter(Sett.opening_file), F.document)
+async def open_import_file(msg: Message, state: FSMContext, user):
+    from ..tools import import_opening_stock
+    doc = msg.document
+    buf = io.BytesIO()
+    await msg.bot.download(doc, destination=buf)
+    try:
+        created, errors = import_opening_stock(doc.file_name, buf.getvalue(), user["telegram_id"])
+    except Exception as e:
+        return await msg.answer(f"⚠️ Не вдалося прочитати файл: {e}")
+    await state.clear()
+    txt = f"✅ Створено партій початкового залишку: {created}"
     if errors:
         txt += "\n\n⚠️ Помилки:\n" + "\n".join(errors[:15])
     await msg.answer(txt, reply_markup=main_menu(user["role"]))

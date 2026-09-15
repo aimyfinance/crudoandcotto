@@ -72,6 +72,42 @@ def import_products(name: str, data: bytes) -> tuple[int, int, list[str]]:
     return created, skipped, errors
 
 
+def import_opening_stock(name: str, data: bytes, user_id: int) -> tuple[int, list[str]]:
+    """Файл з колонками name; kg; price_per_kg; expiry (дата, необов'язково). -> (створено партій, помилки)"""
+    import datetime as dt
+    db = get_db()
+    created, errors = 0, []
+    for i, row in enumerate(_rows(name, data), 2):
+        nm = row.get("name", "")
+        if not nm:
+            continue
+        prod = db.one("SELECT id FROM products WHERE lower(name)=lower(?)", (nm,))
+        if not prod:
+            errors.append(f"рядок {i}: товар «{nm}» не знайдено — спочатку імпортуйте товари")
+            continue
+        try:
+            kg = Decimal(row["kg"].replace(",", ".").replace(" ", ""))
+            price = Decimal(row["price_per_kg"].replace(",", ".").replace(" ", ""))
+        except (KeyError, ValueError, ArithmeticError):
+            errors.append(f"рядок {i} ({nm}): некоректні kg / price_per_kg")
+            continue
+        grams = int((kg * 1000).quantize(Decimal("1")))
+        if grams <= 0:
+            continue
+        exp = None
+        raw = row.get("expiry") or ""
+        if raw:
+            for fmt in ("%d.%m.%Y", "%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%d/%m/%Y"):
+                try:
+                    exp = dt.datetime.strptime(raw[:19], fmt).date().isoformat()
+                    break
+                except ValueError:
+                    pass
+        S.add_opening_stock(db, user_id, prod["id"], grams, price, exp, comment="імпорт початкових залишків")
+        created += 1
+    return created, errors
+
+
 def seed_products(path: str) -> None:
     c, s, errs = import_products(path, open(path, "rb").read())
     print(f"створено: {c}, пропущено (вже є): {s}")
