@@ -1,0 +1,700 @@
+"""Бізнес-логіка обліку. Усі функції синхронні і працюють через Database.tx().
+
+Правила:
+  * списання партій — FIFO за датою надходження (received_at, потім id);
+  * собівартість = landed_price_per_kg партії (ціна постачальника +
+    додаткові витрати закупівлі, розподілені пропорційно вазі);
+  * не можна продати більше, ніж є в залишку (перевірка в тій же транзакції,
+    що і списання);
+  * скасування не видаляє документ — змінює статус і додає зворотні рухи.
+"""
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from decimal import Decimal
+
+from .db import Database, now_utc, today_local, local_date_of
+from .money import ZERO, d, round_cents, line_amount, piece_amount, PRICE_PREC
+
+CATEGORIES = {"cheese": "Сир", "meat": "М'ясні вироби", "pasta": "Паста / напівфабрикати"}
+PAYMENTS = {"cash": "Готівка", "card": "Картка", "other": "Інше"}
+ROLES = {"admin": "Адміністратор", "manager": "Менеджер", "seller": "Продавець"}
+
+
+class StockError(Exception):
+    pass
+
+
+class InsufficientStock(StockError):
+    def __init__(self, product_name: str, need: int, have: int):
+        super().__init__(f"Недостатньо «{product_name}»: потрібно {need} г, є {have} г")
+        self.product_name, self.need, self.have = product_name, need, have
+
+
+class DuplicateOperation(StockError):
+    pass
+
+
+# ======================= користувачі =======================
+
+def ensure_admins(db: Database, admin_ids: list[int]) -> None:
+    with db.tx() as c:
+        for uid in admin_ids:
+            c.execute(
+                "INSERT INTO users(telegram_id, name, role, active, created_at) VALUES (?,?,?,1,?) "
+                "ON CONFLICT(telegram_id) DO UPDATE SET role='admin', active=1",
+                (uid, "", "admin", now_utc()),
+            )
+
+
+def get_user(db: Database, tg_id: int):
+    return db.one("SELECT * FROM users WHERE telegram_id=? AND active=1", (tg_id,))
+
+
+def list_users(db: Database):
+    return db.q("SELECT * FROM users ORDER BY role, name")
+
+
+def upsert_user(db: Database, tg_id: int, role: str, name: str = "") -> None:
+    with db.tx() as c:
+        c.execute(
+            "INSERT INTO users(telegram_id, name, role, active, created_at) VALUES (?,?,?,1,?) "
+            "ON CONFLICT(telegram_id) DO UPDATE SET role=excluded.role, active=1, "
+            "name=CASE WHEN excluded.name='' THEN users.name ELSE excluded.name END",
+            (tg_id, name, role, now_utc()),
+        )
+
+
+def deactivate_user(db: Database, tg_id: int) -> None:
+    with db.tx() as c:
+        c.execute("UPDATE users SET active=0 WHERE telegram_id=?", (tg_id,))
+
+
+def touch_user_name(db: Database, tg_id: int, name: str) -> None:
+    with db.tx() as c:
+        c.execute("UPDATE users SET name=? WHERE telegram_id=? AND name=''", (name, tg_id))
+
+
+def audit(c, user_id: int, action: str, details: dict | str | None = None) -> None:
+    c.execute(
+        "INSERT INTO audit_log(ts, user_id, action, details) VALUES (?,?,?,?)",
+        (now_utc(), user_id, action, json.dumps(details, ensure_ascii=False) if isinstance(details, dict) else details),
+    )
+
+
+# ======================= ідемпотентність =======================
+
+def claim_key(db: Database, key: str) -> bool:
+    """True — ключ новий (обробляємо), False — вже оброблявся (ігноруємо)."""
+    with db.tx() as c:
+        try:
+            c.execute("INSERT INTO processed_updates(key, ts) VALUES (?,?)", (key, now_utc()))
+            return True
+        except Exception:
+            return False
+
+
+def purge_old_keys(db: Database, keep: int = 20000) -> None:
+    with db.tx() as c:
+        c.execute(
+            "DELETE FROM processed_updates WHERE key NOT IN (SELECT key FROM processed_updates ORDER BY ts DESC LIMIT ?)",
+            (keep,),
+        )
+
+
+# ======================= товари =======================
+
+def create_product(db: Database, name: str, category: str, sale_mode: str, retail_price: Decimal,
+                   piece_grams: int | None = None, sku: str | None = None) -> int:
+    if sale_mode == "piece" and not piece_grams:
+        raise ValueError("Для штучного товару вкажіть вагу упаковки в грамах")
+    ts = now_utc()
+    with db.tx() as c:
+        cur = c.execute(
+            "INSERT INTO products(name, category, sku, sale_mode, piece_grams, retail_price, active, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,1,?,?)",
+            (name.strip(), category, (sku or "").strip() or None, sale_mode, piece_grams, str(retail_price), ts, ts),
+        )
+        return cur.lastrowid
+
+
+def update_product(db: Database, product_id: int, **fields) -> None:
+    allowed = {"name", "category", "sku", "sale_mode", "piece_grams", "retail_price", "active"}
+    sets, vals = [], []
+    for k, v in fields.items():
+        if k not in allowed:
+            raise ValueError(k)
+        sets.append(f"{k}=?")
+        vals.append(str(v) if isinstance(v, Decimal) else v)
+    sets.append("updated_at=?")
+    vals.append(now_utc())
+    vals.append(product_id)
+    with db.tx() as c:
+        c.execute(f"UPDATE products SET {', '.join(sets)} WHERE id=?", vals)
+
+
+def list_products(db: Database, active_only: bool = True, category: str | None = None):
+    sql = "SELECT * FROM products WHERE 1=1"
+    p: list = []
+    if active_only:
+        sql += " AND active=1"
+    if category:
+        sql += " AND category=?"
+        p.append(category)
+    sql += " ORDER BY category, name"
+    return db.q(sql, p)
+
+
+def get_product(db: Database, product_id: int):
+    return db.one("SELECT * FROM products WHERE id=?", (product_id,))
+
+
+def find_products(db: Database, text: str):
+    return db.q("SELECT * FROM products WHERE active=1 AND lower(name) LIKE ? ORDER BY name LIMIT 20",
+                (f"%{text.lower()}%",))
+
+
+# ======================= постачальники =======================
+
+def get_or_create_supplier(db: Database, name: str) -> int:
+    name = name.strip()
+    row = db.one("SELECT id FROM suppliers WHERE lower(name)=lower(?)", (name,))
+    if row:
+        return row["id"]
+    with db.tx() as c:
+        return c.execute("INSERT INTO suppliers(name) VALUES (?)", (name,)).lastrowid
+
+
+def list_suppliers(db: Database):
+    return db.q("SELECT * FROM suppliers ORDER BY name")
+
+
+# ======================= закупівля =======================
+
+@dataclass
+class PurchaseLine:
+    product_id: int
+    grams: int
+    price_per_kg: Decimal
+    expiry_date: str | None = None
+    batch_code: str | None = None
+    comment: str | None = None
+
+    @property
+    def amount(self) -> Decimal:
+        return line_amount(self.grams, self.price_per_kg)
+
+
+def create_purchase(db: Database, user_id: int, doc_date: str, supplier_name: str,
+                    lines: list[PurchaseLine], extra_costs: Decimal = ZERO, comment: str | None = None,
+                    receive: bool = True) -> int:
+    """Створює закупівлю; якщо receive=True — одразу підтверджує надходження і створює партії."""
+    if not lines:
+        raise ValueError("Закупівля без позицій")
+    supplier_id = get_or_create_supplier(db, supplier_name) if supplier_name else None
+    ts = now_utc()
+    with db.tx() as c:
+        pid = c.execute(
+            "INSERT INTO purchases(doc_date, supplier_id, status, extra_costs, comment, created_by, created_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (doc_date, supplier_id, "draft", str(extra_costs), comment, user_id, ts),
+        ).lastrowid
+        for ln in lines:
+            c.execute(
+                "INSERT INTO purchase_lines(purchase_id, product_id, batch_code, grams, price_per_kg, amount, expiry_date, comment) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (pid, ln.product_id, ln.batch_code, ln.grams, str(ln.price_per_kg), str(ln.amount), ln.expiry_date, ln.comment),
+            )
+        audit(c, user_id, "purchase.create", {"purchase_id": pid})
+        if receive:
+            _receive_purchase(c, pid, user_id)
+    return pid
+
+
+def receive_purchase(db: Database, purchase_id: int, user_id: int) -> None:
+    with db.tx() as c:
+        _receive_purchase(c, purchase_id, user_id)
+
+
+def _receive_purchase(c, purchase_id: int, user_id: int) -> None:
+    p = c.execute("SELECT * FROM purchases WHERE id=?", (purchase_id,)).fetchone()
+    if not p:
+        raise ValueError("Закупівлю не знайдено")
+    if p["status"] != "draft":
+        raise DuplicateOperation("Ця закупівля вже підтверджена або скасована")
+    lines = c.execute("SELECT * FROM purchase_lines WHERE purchase_id=? ORDER BY id", (purchase_id,)).fetchall()
+    total_grams = sum(l["grams"] for l in lines)
+    extra = d(p["extra_costs"])
+    # розподіл додаткових витрат пропорційно вазі => однакова надбавка €/кг для всіх позицій
+    extra_per_kg = (extra * 1000 / Decimal(total_grams)).quantize(PRICE_PREC) if total_grams and extra else ZERO
+    ts = now_utc()
+    received_at = f"{p['doc_date']}T00:00:00+00:00"  # FIFO за датою документа закупівлі
+    for l in lines:
+        landed = (d(l["price_per_kg"]) + extra_per_kg).quantize(PRICE_PREC)
+        bid = c.execute(
+            "INSERT INTO batches(product_id, purchase_id, purchase_line_id, batch_code, source, grams_in, grams_left, "
+            "price_per_kg, landed_price_per_kg, expiry_date, received_at, comment) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (l["product_id"], purchase_id, l["id"], l["batch_code"], "purchase", l["grams"], l["grams"],
+             l["price_per_kg"], str(landed), l["expiry_date"], received_at, l["comment"]),
+        ).lastrowid
+        _movement(c, ts, l["product_id"], bid, l["grams"], round_cents(Decimal(l["grams"]) * landed / 1000),
+                  "purchase", "purchase", purchase_id, user_id)
+    c.execute("UPDATE purchases SET status='received', received_at=? WHERE id=?", (ts, purchase_id))
+    audit(c, user_id, "purchase.receive", {"purchase_id": purchase_id})
+
+
+def cancel_purchase(db: Database, purchase_id: int, user_id: int, reason: str) -> None:
+    """Скасування можливе, лише якщо з жодної партії ще нічого не списано."""
+    with db.tx() as c:
+        p = c.execute("SELECT * FROM purchases WHERE id=?", (purchase_id,)).fetchone()
+        if not p or p["status"] == "cancelled":
+            raise DuplicateOperation("Закупівля вже скасована або не існує")
+        if p["status"] == "received":
+            used = c.execute(
+                "SELECT COUNT(*) FROM batches WHERE purchase_id=? AND grams_left <> grams_in", (purchase_id,)
+            ).fetchone()[0]
+            if used:
+                raise StockError("З партій цієї закупівлі вже були продажі/списання — спочатку скасуйте їх")
+            ts = now_utc()
+            for b in c.execute("SELECT * FROM batches WHERE purchase_id=?", (purchase_id,)):
+                _movement(c, ts, b["product_id"], b["id"], -b["grams_in"],
+                          -round_cents(Decimal(b["grams_in"]) * d(b["landed_price_per_kg"]) / 1000),
+                          "purchase_cancel", "purchase", purchase_id, user_id)
+                c.execute("UPDATE batches SET grams_left=0 WHERE id=?", (b["id"],))
+        c.execute("UPDATE purchases SET status='cancelled', cancelled_at=?, cancelled_by=?, cancel_reason=? WHERE id=?",
+                  (now_utc(), user_id, reason, purchase_id))
+        audit(c, user_id, "purchase.cancel", {"purchase_id": purchase_id, "reason": reason})
+
+
+def add_opening_stock(db: Database, user_id: int, product_id: int, grams: int, price_per_kg: Decimal,
+                      expiry_date: str | None = None, date: str | None = None, comment: str | None = None) -> int:
+    date = date or today_local()
+    ts = now_utc()
+    with db.tx() as c:
+        bid = c.execute(
+            "INSERT INTO batches(product_id, purchase_id, purchase_line_id, batch_code, source, grams_in, grams_left, "
+            "price_per_kg, landed_price_per_kg, expiry_date, received_at, comment) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (product_id, None, None, "початковий", "opening", grams, grams, str(price_per_kg), str(price_per_kg),
+             expiry_date, f"{date}T00:00:00+00:00", comment),
+        ).lastrowid
+        _movement(c, ts, product_id, bid, grams, round_cents(Decimal(grams) * price_per_kg / 1000),
+                  "opening", "batch", bid, user_id)
+        audit(c, user_id, "stock.opening", {"batch_id": bid})
+        return bid
+
+
+def _movement(c, ts, product_id, batch_id, grams_delta, cost_delta: Decimal, kind, ref_type, ref_id, user_id):
+    c.execute(
+        "INSERT INTO stock_movements(ts, product_id, batch_id, grams_delta, cost_delta, kind, ref_type, ref_id, user_id) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (ts, product_id, batch_id, grams_delta, str(cost_delta), kind, ref_type, ref_id, user_id),
+    )
+
+
+# ======================= залишки =======================
+
+def stock_of_product(c_or_db, product_id: int) -> int:
+    ex = c_or_db.execute if hasattr(c_or_db, "execute") else c_or_db.conn.execute
+    row = ex("SELECT COALESCE(SUM(grams_left),0) FROM batches WHERE product_id=? AND grams_left>0", (product_id,)).fetchone()
+    return int(row[0])
+
+
+def stock_summary(db: Database, include_zero: bool = False):
+    """[{product, grams, cost_value, nearest_expiry}]"""
+    rows = db.q(
+        "SELECT p.id, p.name, p.category, p.sale_mode, p.piece_grams, p.retail_price, "
+        "COALESCE(SUM(b.grams_left),0) AS grams, "
+        "MIN(CASE WHEN b.grams_left>0 THEN b.expiry_date END) AS nearest_expiry "
+        "FROM products p LEFT JOIN batches b ON b.product_id=p.id AND b.grams_left>0 "
+        "WHERE p.active=1 GROUP BY p.id ORDER BY p.category, p.name"
+    )
+    out = []
+    for r in rows:
+        if not include_zero and r["grams"] == 0:
+            continue
+        val = ZERO
+        for b in db.q("SELECT grams_left, landed_price_per_kg FROM batches WHERE product_id=? AND grams_left>0", (r["id"],)):
+            val += round_cents(Decimal(b["grams_left"]) * d(b["landed_price_per_kg"]) / 1000)
+        out.append({"product": r, "grams": int(r["grams"]), "cost_value": val, "nearest_expiry": r["nearest_expiry"]})
+    return out
+
+
+def batches_of_product(db: Database, product_id: int, only_open: bool = True):
+    sql = "SELECT * FROM batches WHERE product_id=?"
+    if only_open:
+        sql += " AND grams_left>0"
+    return db.q(sql + " ORDER BY received_at, id", (product_id,))
+
+
+def batches_expiring(db: Database, days: int = 7):
+    return db.q(
+        "SELECT b.*, p.name AS product_name FROM batches b JOIN products p ON p.id=b.product_id "
+        "WHERE b.grams_left>0 AND b.expiry_date IS NOT NULL AND b.expiry_date <= date(?, ?) "
+        "ORDER BY b.expiry_date",
+        (today_local(), f"+{days} days"),
+    )
+
+
+# ======================= продаж =======================
+
+@dataclass
+class SaleLine:
+    product_id: int
+    grams: int
+    price: Decimal          # застосована ціна (€/кг або €/шт)
+    pieces: int | None = None
+
+    def amount(self) -> Decimal:
+        if self.pieces:
+            return piece_amount(self.pieces, self.price)
+        return line_amount(self.grams, self.price)
+
+
+@dataclass
+class SaleResult:
+    sale_id: int
+    total: Decimal
+    cost_total: Decimal
+    lines: list = field(default_factory=list)
+
+
+def _consume_fifo(c, product_id: int, grams: int, product_name: str) -> list[tuple[int, int, Decimal]]:
+    """Списує grams з партій за FIFO. Повертає [(batch_id, grams, cost)]. Кидає InsufficientStock."""
+    have = stock_of_product(c, product_id)
+    if have < grams:
+        raise InsufficientStock(product_name, grams, have)
+    left = grams
+    taken = []
+    for b in c.execute("SELECT * FROM batches WHERE product_id=? AND grams_left>0 ORDER BY received_at, id", (product_id,)):
+        if left <= 0:
+            break
+        take = min(left, b["grams_left"])
+        cost = round_cents(Decimal(take) * d(b["landed_price_per_kg"]) / 1000)
+        c.execute("UPDATE batches SET grams_left=grams_left-? WHERE id=? AND grams_left>=?", (take, b["id"], take))
+        taken.append((b["id"], take, cost))
+        left -= take
+    if left != 0:  # pragma: no cover — захист від гонки
+        raise InsufficientStock(product_name, grams, have)
+    return taken
+
+
+def create_sale(db: Database, user_id: int, lines: list[SaleLine], payment_method: str,
+                client_key: str | None = None, comment: str | None = None) -> SaleResult:
+    if not lines:
+        raise ValueError("Продаж без позицій")
+    ts = now_utc()
+    with db.tx() as c:
+        if client_key:
+            dup = c.execute("SELECT id, total, cost_total FROM sales WHERE client_key=?", (client_key,)).fetchone()
+            if dup:
+                raise DuplicateOperation(f"Продаж №{dup['id']} уже проведено")
+        total = ZERO
+        cost_total = ZERO
+        sid = c.execute(
+            "INSERT INTO sales(sold_at, sale_date, payment_method, status, total, cost_total, comment, created_by, created_at, client_key) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (ts, local_date_of(ts), payment_method, "done", "0", "0", comment, user_id, ts, client_key),
+        ).lastrowid
+        out_lines = []
+        for ln in lines:
+            prod = c.execute("SELECT * FROM products WHERE id=?", (ln.product_id,)).fetchone()
+            if not prod or not prod["active"]:
+                raise ValueError("Товар не знайдено або архівний")
+            taken = _consume_fifo(c, ln.product_id, ln.grams, prod["name"])
+            cost = sum((t[2] for t in taken), ZERO)
+            amt = ln.amount()
+            lid = c.execute(
+                "INSERT INTO sale_lines(sale_id, product_id, grams, pieces, price, amount, cost) VALUES (?,?,?,?,?,?,?)",
+                (sid, ln.product_id, ln.grams, ln.pieces, str(ln.price), str(amt), str(cost)),
+            ).lastrowid
+            for bid, g, cst in taken:
+                c.execute("INSERT INTO sale_line_batches(sale_line_id, batch_id, grams, cost) VALUES (?,?,?,?)",
+                          (lid, bid, g, str(cst)))
+                _movement(c, ts, ln.product_id, bid, -g, -cst, "sale", "sale", sid, user_id)
+            total += amt
+            cost_total += cost
+            out_lines.append({"product": prod["name"], "grams": ln.grams, "pieces": ln.pieces, "price": ln.price,
+                              "amount": amt, "cost": cost})
+        c.execute("UPDATE sales SET total=?, cost_total=? WHERE id=?", (str(total), str(cost_total), sid))
+        audit(c, user_id, "sale.create", {"sale_id": sid, "total": str(total)})
+    return SaleResult(sid, total, cost_total, out_lines)
+
+
+def cancel_sale(db: Database, sale_id: int, user_id: int, reason: str) -> None:
+    ts = now_utc()
+    with db.tx() as c:
+        s = c.execute("SELECT * FROM sales WHERE id=?", (sale_id,)).fetchone()
+        if not s:
+            raise ValueError("Продаж не знайдено")
+        if s["status"] == "cancelled":
+            raise DuplicateOperation("Продаж уже скасовано")
+        for slb in c.execute(
+            "SELECT slb.*, sl.product_id FROM sale_line_batches slb JOIN sale_lines sl ON sl.id=slb.sale_line_id "
+            "WHERE sl.sale_id=?", (sale_id,)
+        ).fetchall():
+            c.execute("UPDATE batches SET grams_left=grams_left+? WHERE id=?", (slb["grams"], slb["batch_id"]))
+            _movement(c, ts, slb["product_id"], slb["batch_id"], slb["grams"], d(slb["cost"]),
+                      "sale_cancel", "sale", sale_id, user_id)
+        c.execute("UPDATE sales SET status='cancelled', cancelled_at=?, cancelled_by=?, cancel_reason=? WHERE id=?",
+                  (ts, user_id, reason, sale_id))
+        audit(c, user_id, "sale.cancel", {"sale_id": sale_id, "reason": reason})
+
+
+def get_sale(db: Database, sale_id: int):
+    s = db.one("SELECT * FROM sales WHERE id=?", (sale_id,))
+    if not s:
+        return None, []
+    lines = db.q("SELECT sl.*, p.name AS product_name, p.sale_mode FROM sale_lines sl JOIN products p ON p.id=sl.product_id "
+                 "WHERE sl.sale_id=? ORDER BY sl.id", (sale_id,))
+    return s, lines
+
+
+def recent_sales(db: Database, limit: int = 15, date: str | None = None):
+    if date:
+        return db.q("SELECT * FROM sales WHERE sale_date=? ORDER BY id DESC LIMIT ?", (date, limit))
+    return db.q("SELECT * FROM sales ORDER BY id DESC LIMIT ?", (limit,))
+
+
+# ======================= списання / коригування =======================
+
+def write_off(db: Database, user_id: int, product_id: int, grams: int, reason: str,
+              batch_id: int | None = None) -> int:
+    """Списання з причиною. Якщо batch_id не вказано — FIFO."""
+    ts = now_utc()
+    with db.tx() as c:
+        prod = c.execute("SELECT name FROM products WHERE id=?", (product_id,)).fetchone()
+        if batch_id:
+            b = c.execute("SELECT * FROM batches WHERE id=? AND product_id=?", (batch_id, product_id)).fetchone()
+            if not b:
+                raise ValueError("Партію не знайдено")
+            if b["grams_left"] < grams:
+                raise InsufficientStock(prod["name"], grams, b["grams_left"])
+            cost = round_cents(Decimal(grams) * d(b["landed_price_per_kg"]) / 1000)
+            c.execute("UPDATE batches SET grams_left=grams_left-? WHERE id=?", (grams, batch_id))
+            taken = [(batch_id, grams, cost)]
+        else:
+            taken = _consume_fifo(c, product_id, grams, prod["name"])
+        cost_total = sum((t[2] for t in taken), ZERO)
+        wid = c.execute(
+            "INSERT INTO writeoffs(ts, op_date, kind, product_id, batch_id, grams_delta, cost_delta, reason, status, created_by) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (ts, local_date_of(ts), "writeoff", product_id, batch_id, -grams, str(-cost_total), reason, "done", user_id),
+        ).lastrowid
+        for bid, g, cst in taken:
+            c.execute("INSERT INTO writeoff_batches(writeoff_id, batch_id, grams_delta, cost_delta) VALUES (?,?,?,?)",
+                      (wid, bid, -g, str(-cst)))
+            _movement(c, ts, product_id, bid, -g, -cst, "writeoff", "writeoff", wid, user_id)
+        audit(c, user_id, "writeoff.create", {"writeoff_id": wid, "reason": reason})
+        return wid
+
+
+def inventory_adjust(db: Database, user_id: int, batch_id: int, actual_grams: int, reason: str) -> int:
+    """Інвентаризаційне коригування конкретної партії до фактичного залишку."""
+    ts = now_utc()
+    with db.tx() as c:
+        b = c.execute("SELECT * FROM batches WHERE id=?", (batch_id,)).fetchone()
+        if not b:
+            raise ValueError("Партію не знайдено")
+        delta = actual_grams - b["grams_left"]
+        if delta == 0:
+            raise ValueError("Фактичний залишок збігається з обліковим — коригування не потрібне")
+        cost_delta = round_cents(Decimal(delta) * d(b["landed_price_per_kg"]) / 1000)
+        c.execute("UPDATE batches SET grams_left=? WHERE id=?", (actual_grams, batch_id))
+        wid = c.execute(
+            "INSERT INTO writeoffs(ts, op_date, kind, product_id, batch_id, grams_delta, cost_delta, reason, status, created_by) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (ts, local_date_of(ts), "adjustment", b["product_id"], batch_id, delta, str(cost_delta), reason, "done", user_id),
+        ).lastrowid
+        c.execute("INSERT INTO writeoff_batches(writeoff_id, batch_id, grams_delta, cost_delta) VALUES (?,?,?,?)",
+                  (wid, batch_id, delta, str(cost_delta)))
+        _movement(c, ts, b["product_id"], batch_id, delta, cost_delta, "adjustment", "writeoff", wid, user_id)
+        audit(c, user_id, "adjustment.create", {"writeoff_id": wid, "delta": delta, "reason": reason})
+        return wid
+
+
+def cancel_writeoff(db: Database, writeoff_id: int, user_id: int, reason: str) -> None:
+    ts = now_utc()
+    with db.tx() as c:
+        w = c.execute("SELECT * FROM writeoffs WHERE id=?", (writeoff_id,)).fetchone()
+        if not w:
+            raise ValueError("Операцію не знайдено")
+        if w["status"] == "cancelled":
+            raise DuplicateOperation("Операцію вже скасовано")
+        for wb in c.execute("SELECT * FROM writeoff_batches WHERE writeoff_id=?", (writeoff_id,)).fetchall():
+            b = c.execute("SELECT grams_left FROM batches WHERE id=?", (wb["batch_id"],)).fetchone()
+            new_left = b["grams_left"] - wb["grams_delta"]
+            if new_left < 0:
+                raise StockError("Неможливо скасувати: залишок партії вже витрачено")
+            c.execute("UPDATE batches SET grams_left=? WHERE id=?", (new_left, wb["batch_id"]))
+            _movement(c, ts, w["product_id"], wb["batch_id"], -wb["grams_delta"], -d(wb["cost_delta"]),
+                      f"{w['kind']}_cancel", "writeoff", writeoff_id, user_id)
+        c.execute("UPDATE writeoffs SET status='cancelled', cancelled_at=?, cancelled_by=?, cancel_reason=? WHERE id=?",
+                  (ts, user_id, reason, writeoff_id))
+        audit(c, user_id, "writeoff.cancel", {"writeoff_id": writeoff_id, "reason": reason})
+
+
+def recent_writeoffs(db: Database, limit: int = 15):
+    return db.q("SELECT w.*, p.name AS product_name FROM writeoffs w JOIN products p ON p.id=w.product_id "
+                "ORDER BY w.id DESC LIMIT ?", (limit,))
+
+
+def recent_purchases(db: Database, limit: int = 15):
+    return db.q("SELECT pu.*, s.name AS supplier_name FROM purchases pu LEFT JOIN suppliers s ON s.id=pu.supplier_id "
+                "ORDER BY pu.id DESC LIMIT ?", (limit,))
+
+
+# ======================= звіти =======================
+
+def report_period(db: Database, date_from: str, date_to: str) -> dict:
+    """Звіт за період [date_from, date_to] (дати за Europe/Vienna, включно)."""
+    sales = db.q("SELECT * FROM sales WHERE status='done' AND sale_date BETWEEN ? AND ?", (date_from, date_to))
+    sale_ids = [s["id"] for s in sales]
+    revenue = sum((d(s["total"]) for s in sales), ZERO)
+    cogs = sum((d(s["cost_total"]) for s in sales), ZERO)
+    by_payment = {}
+    for s in sales:
+        by_payment[s["payment_method"]] = by_payment.get(s["payment_method"], ZERO) + d(s["total"])
+
+    by_product: dict[int, dict] = {}
+    if sale_ids:
+        qmarks = ",".join("?" * len(sale_ids))
+        for l in db.q(f"SELECT sl.*, p.name, p.category FROM sale_lines sl JOIN products p ON p.id=sl.product_id "
+                      f"WHERE sl.sale_id IN ({qmarks})", sale_ids):
+            e = by_product.setdefault(l["product_id"], {"name": l["name"], "category": l["category"], "grams": 0,
+                                                        "pieces": 0, "amount": ZERO, "cost": ZERO})
+            e["grams"] += l["grams"]
+            e["pieces"] += l["pieces"] or 0
+            e["amount"] += d(l["amount"])
+            e["cost"] += d(l["cost"])
+    for e in by_product.values():
+        e["gross_profit"] = e["amount"] - e["cost"]
+        e["margin_pct"] = (e["gross_profit"] / e["amount"] * 100) if e["amount"] else ZERO
+
+    purchases = db.q(
+        "SELECT pl.grams, pl.amount, pu.extra_costs, pu.id AS pid FROM purchase_lines pl JOIN purchases pu ON pu.id=pl.purchase_id "
+        "WHERE pu.status='received' AND pu.doc_date BETWEEN ? AND ?", (date_from, date_to))
+    purchased_grams = sum(r["grams"] for r in purchases)
+    purchased_amount = sum((d(r["amount"]) for r in purchases), ZERO)
+    extra = sum((d(r["extra_costs"]) for r in db.q(
+        "SELECT extra_costs FROM purchases WHERE status='received' AND doc_date BETWEEN ? AND ?", (date_from, date_to))), ZERO)
+
+    wos = db.q("SELECT w.*, p.name AS product_name FROM writeoffs w JOIN products p ON p.id=w.product_id "
+               "WHERE w.status='done' AND w.op_date BETWEEN ? AND ? ORDER BY w.ts", (date_from, date_to))
+    writeoff_grams = sum(-w["grams_delta"] for w in wos if w["grams_delta"] < 0)
+    writeoff_cost = sum((-d(w["cost_delta"]) for w in wos if w["grams_delta"] < 0), ZERO)
+    adj_grams = sum(w["grams_delta"] for w in wos if w["kind"] == "adjustment")
+    adj_cost = sum((d(w["cost_delta"]) for w in wos if w["kind"] == "adjustment"), ZERO)
+
+    stock = stock_summary(db)
+    return {
+        "date_from": date_from, "date_to": date_to,
+        "sales_count": len(sales), "revenue": revenue, "cogs": cogs, "gross_profit": revenue - cogs,
+        "by_payment": by_payment, "by_product": sorted(by_product.values(), key=lambda e: -e["amount"]),
+        "sold_grams": sum(e["grams"] for e in by_product.values()),
+        "purchased_grams": purchased_grams, "purchased_amount": purchased_amount, "purchase_extra_costs": extra,
+        "writeoffs": wos, "writeoff_grams": writeoff_grams, "writeoff_cost": writeoff_cost,
+        "adjustment_grams": adj_grams, "adjustment_cost": adj_cost,
+        "stock": stock, "stock_grams": sum(s["grams"] for s in stock),
+        "stock_value": sum((s["cost_value"] for s in stock), ZERO),
+    }
+
+
+def product_ledger(db: Database, date_from: str, date_to: str) -> list[dict]:
+    """Рядки для аркуша «Товар» у структурі звіту менеджера: по кожній партії —
+    залишок на початок, закупівля, продаж, прибуток, втрати, залишок на кінець."""
+    start_ts = f"{date_from}T00:00:00+00:00"
+    end_ts = f"{date_to}T23:59:59+00:00"
+    out = []
+    for p in db.q("SELECT * FROM products ORDER BY category, name"):
+        for b in db.q("SELECT * FROM batches WHERE product_id=? ORDER BY received_at, id", (p["id"],)):
+            movs = db.q("SELECT * FROM stock_movements WHERE batch_id=? ORDER BY ts, id", (b["id"],))
+            opening_g, opening_c = 0, ZERO
+            buy_g, buy_c = 0, ZERO
+            sold_g, sold_rev, sold_cost = 0, ZERO, ZERO
+            loss_g, loss_c = 0, ZERO
+            for m in movs:
+                # рухи з датою за Відень
+                mdate = local_date_of(m["ts"]) if m["kind"] not in ("purchase", "opening", "purchase_cancel") else b["received_at"][:10]
+                g, cst = m["grams_delta"], d(m["cost_delta"])
+                if mdate < date_from:
+                    opening_g += g
+                    opening_c += cst
+                    continue
+                if mdate > date_to:
+                    continue
+                if m["kind"] in ("purchase", "opening", "purchase_cancel"):
+                    buy_g += g
+                    buy_c += cst
+                elif m["kind"] in ("sale", "sale_cancel"):
+                    sold_g -= g
+                    sold_cost -= cst
+                else:
+                    loss_g -= g
+                    loss_c -= cst
+            # виручка по партії — з sale_line_batches (пропорційно вазі позиції)
+            for r in db.q(
+                "SELECT slb.grams, sl.grams AS line_grams, sl.amount FROM sale_line_batches slb "
+                "JOIN sale_lines sl ON sl.id=slb.sale_line_id JOIN sales s ON s.id=sl.sale_id "
+                "WHERE slb.batch_id=? AND s.status='done' AND s.sale_date BETWEEN ? AND ?", (b["id"], date_from, date_to)):
+                sold_rev += d(r["amount"]) * Decimal(r["grams"]) / Decimal(r["line_grams"])
+            sold_rev = round_cents(sold_rev)
+            closing_g = opening_g + buy_g - sold_g - loss_g
+            if not any((opening_g, buy_g, sold_g, loss_g, closing_g)):
+                continue
+            landed = d(b["landed_price_per_kg"])
+            out.append({
+                "product": p["name"], "category": CATEGORIES[p["category"]], "batch": b["batch_code"] or f"#{b['id']}",
+                "batch_id": b["id"], "date": b["received_at"][:10], "expiry": b["expiry_date"],
+                "opening_g": opening_g, "opening_c": opening_c,
+                "buy_g": buy_g, "buy_price": d(b["price_per_kg"]), "landed_price": landed, "buy_c": buy_c,
+                "sold_g": sold_g, "sold_price": (sold_rev * 1000 / sold_g) if sold_g else None, "sold_rev": sold_rev,
+                "profit": sold_rev - sold_cost, "sold_cost": sold_cost,
+                "loss_g": loss_g, "loss_c": loss_c,
+                "closing_g": closing_g, "closing_c": round_cents(Decimal(closing_g) * landed / 1000),
+            })
+    return out
+
+
+def movements_export(db: Database, date_from: str, date_to: str):
+    return db.q(
+        "SELECT m.*, p.name AS product_name, b.batch_code, b.landed_price_per_kg, u.name AS user_name "
+        "FROM stock_movements m JOIN products p ON p.id=m.product_id JOIN batches b ON b.id=m.batch_id "
+        "LEFT JOIN users u ON u.telegram_id=m.user_id "
+        "WHERE m.ts BETWEEN ? AND ? ORDER BY m.ts, m.id",
+        (f"{date_from}T00:00:00", f"{date_to}T23:59:59+99:99"),
+    )
+
+
+# ======================= каса: імпорт і звірка =======================
+
+def save_cash_day(db: Database, user_id: int, day: str, cash: Decimal, card: Decimal, source_file: str | None) -> None:
+    with db.tx() as c:
+        c.execute(
+            "INSERT INTO cash_register_days(day, cash, card, total, source_file, imported_at, imported_by) VALUES (?,?,?,?,?,?,?) "
+            "ON CONFLICT(day) DO UPDATE SET cash=excluded.cash, card=excluded.card, total=excluded.total, "
+            "source_file=excluded.source_file, imported_at=excluded.imported_at, imported_by=excluded.imported_by",
+            (day, str(cash), str(card), str(cash + card), source_file, now_utc(), user_id),
+        )
+
+
+def reconcile(db: Database, date_from: str, date_to: str) -> list[dict]:
+    days = {}
+    for s in db.q("SELECT sale_date, payment_method, total FROM sales WHERE status='done' AND sale_date BETWEEN ? AND ?",
+                  (date_from, date_to)):
+        e = days.setdefault(s["sale_date"], {"bot_cash": ZERO, "bot_card": ZERO, "reg_cash": None, "reg_card": None})
+        if s["payment_method"] == "card":
+            e["bot_card"] += d(s["total"])
+        else:
+            e["bot_cash"] += d(s["total"])
+    for r in db.q("SELECT * FROM cash_register_days WHERE day BETWEEN ? AND ?", (date_from, date_to)):
+        e = days.setdefault(r["day"], {"bot_cash": ZERO, "bot_card": ZERO, "reg_cash": None, "reg_card": None})
+        e["reg_cash"], e["reg_card"] = d(r["cash"]), d(r["card"])
+    out = []
+    for day in sorted(days):
+        e = days[day]
+        bot_total = e["bot_cash"] + e["bot_card"]
+        reg_total = (e["reg_cash"] + e["reg_card"]) if e["reg_cash"] is not None else None
+        out.append({"day": day, **e, "bot_total": bot_total, "reg_total": reg_total,
+                    "diff": (bot_total - reg_total) if reg_total is not None else None})
+    return out
