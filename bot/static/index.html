@@ -208,11 +208,14 @@ function render(){
 function go(tab){ state.tab=tab; state.sheet=null; if(tab==='stock') loadStock(); if(tab==='today') refreshToday(); if(tab==='tasks') loadTasks(); render(); }
 
 /* ---------------- Завдання ---------------- */
-async function loadTasks(){ try{ state.tasks=(await api('tasks')).tasks; render(); }catch(e){ toast(e.message,true); } }
+async function loadTasks(){ try{ const r=await api('tasks'); state.tasks=r.tasks; state.tasksDone=r.done||[]; render(); }catch(e){ toast(e.message,true); } }
 function viewTasks(){
   const t=state.tasks; if(!t) return `<div class="loading">…</div>`;
-  if(!t.length) return `<div class="empty">Відкритих завдань немає 🎉</div>`;
-  return `<div class="group">Мої завдання</div>`+t.map(x=>`<div class="line"><div><div class="n">${x.text}</div><div class="q">${x.assignee}${x.due?' · до '+fmtD(x.due):''}${x.overdue?' <span class="warn">прострочено</span>':''}</div></div><button class="btn oak" style="flex:0 0 auto;padding:10px 14px" onclick="doneTask(${x.id})">✅</button></div>`).join('');
+  let html = t.length ? `<div class="group">Відкриті</div>`+t.map(x=>`<div class="line"><div><div class="n">${x.text}</div><div class="q">${x.assignee}${x.due?' · до '+fmtD(x.due):''}${x.overdue?' <span class="warn">прострочено</span>':''}</div></div><button class="btn oak" style="flex:0 0 auto;padding:10px 14px" onclick="doneTask(${x.id})">✅</button></div>`).join('')
+                      : `<div class="empty">Відкритих завдань немає 🎉</div>`;
+  const d=state.tasksDone||[];
+  if(d.length) html += `<div class="group">Виконані (14 днів)</div>`+d.map(x=>`<div class="line" style="opacity:.75"><div><div class="n">${x.status==='done'?'✅':'🗑'} ${x.text}</div><div class="q">${x.by} · ${x.at}</div></div></div>`).join('');
+  return html;
 }
 async function doneTask(id){ try{ const r=await api('tasks/done',{task_id:id}); state.tasks=r.tasks; render(); toast('Виконано'); hap('medium'); }catch(e){ toast(e.message,true); } }
 function closeSheet(){ state.sheet=null; render(); }

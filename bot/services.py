@@ -915,6 +915,24 @@ def task_cancel(db: Database, task_id: int, user_id: int) -> None:
         c.execute("UPDATE tasks SET status='cancelled', done_at=?, done_by=? WHERE id=? AND status='open'", (now_utc(), user_id, task_id))
 
 
+def done_tasks(db: Database, days: int = 30, user_id: int | None = None):
+    """Виконані/скасовані за останні N днів (менеджер бачить усі, продавець — свої)."""
+    since = (dt_date_today() - __import__("datetime").timedelta(days=days)).isoformat()
+    sql = ("SELECT t.*, u.name AS assignee_name, d.name AS done_name FROM tasks t "
+           "LEFT JOIN users u ON u.telegram_id=t.assignee_id LEFT JOIN users d ON d.telegram_id=t.done_by "
+           "WHERE t.status IN ('done','cancelled') AND t.done_at >= ?")
+    p: list = [since]
+    if user_id is not None:
+        sql += " AND (t.assignee_id=? OR t.assignee_id IS NULL OR t.created_by=?)"
+        p += [user_id, user_id]
+    return db.q(sql + " ORDER BY t.done_at DESC LIMIT 30", p)
+
+
+def dt_date_today():
+    import datetime as _dt
+    return _dt.date.fromisoformat(today_local())
+
+
 def overdue_tasks(db: Database, today: str):
     return db.q("SELECT t.*, u.name AS assignee_name FROM tasks t LEFT JOIN users u ON u.telegram_id=t.assignee_id "
                 "WHERE t.status='open' AND t.due_date IS NOT NULL AND t.due_date<=? ORDER BY t.due_date", (today,))

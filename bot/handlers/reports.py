@@ -16,7 +16,7 @@ from .. import services as S
 from ..cash_import import parse_cash_report
 from ..config import TZ, settings
 from ..export import build_csv_movements, build_excel
-from ..keyboards import (CANCEL, M_DOCS_EXP, M_DOCS_PURCH, M_EXP_ADD, M_EXP_LIST, M_REP_MONTH, M_REP_PERIOD, M_REP_TODAY,
+from ..keyboards import (CANCEL, M_DOCS_EXP, M_DOCS_PURCH, M_EXP_ADD, M_EXP_LIST, M_EXP_SUMMARY, M_REP_MONTH, M_REP_PERIOD, M_REP_TODAY,
                          M_REPORTS, M_SETTINGS, inline, main_menu, nav_kb, product_picker)
 from ..money import fmt_grams, fmt_money
 from ..db import today_local, get_db
@@ -138,6 +138,43 @@ async def rep_period_btn(msg: Message, state: FSMContext, user):
         return
     await state.set_state(Rep.period)
     await msg.answer("Введіть період: <code>01.09.2026 - 15.09.2026</code> або одну дату:", reply_markup=nav_kb(back=False))
+
+
+def expense_summary_text(db) -> str:
+    d1, d2 = _period("month")
+    p1, p2 = _period("pmonth")
+    cur, prev = S.expenses_period(db, d1, d2), S.expenses_period(db, p1, p2)
+    rep_cur, rep_prev = S.report_period(db, d1, d2), S.report_period(db, p1, p2)
+    mn = lambda iso: ["січень", "лютий", "березень", "квітень", "травень", "червень", "липень", "серпень", "вересень", "жовтень", "листопад", "грудень"][int(iso[5:7]) - 1]
+    out = [f"💸 <b>Витрати: {mn(d1)} (по {ua_date(d2)}) vs {mn(p1)}</b>"]
+    tot_c = sum(cur["by_type"].values(), Decimal(0))
+    tot_p = sum(prev["by_type"].values(), Decimal(0))
+    for t, label in S.EXP_TYPES.items():
+        c, p = cur["by_type"][t], prev["by_type"][t]
+        if c or p:
+            out.append(f"• {label}: <b>{fmt_money(c)}</b>  (мин. міс. {fmt_money(p)})")
+    out.append(f"Разом: <b>{fmt_money(tot_c)}</b>  (мин. міс. {fmt_money(tot_p)})")
+    opex_c = cur["by_type"]["operating"] + cur["by_type"]["tax"]
+    if rep_cur["revenue"]:
+        out.append(f"Операційні + податки = {opex_c / rep_cur['revenue'] * 100:.0f} % виручки ({fmt_money(rep_cur['revenue'])})")
+    out.append(f"Операційний результат місяця: <b>{fmt_money(rep_cur['operating_result'])}</b>  (мин. міс. {fmt_money(rep_prev['operating_result'])})")
+    top = sorted(((c, v) for (t, c), v in cur["by_category"].items() if t in ("operating", "tax")), key=lambda x: -x[1])[:6]
+    if top:
+        out.append("\n<b>Найбільші операційні цього місяця</b>")
+        prev_cat = {c: v for (t, c), v in prev["by_category"].items()}
+        for c, v in top:
+            pv = prev_cat.get(c)
+            out.append(f"• {c}: {fmt_money(v)}" + (f" (мин. {fmt_money(pv)})" if pv else ""))
+    return "\n".join(out)
+
+
+@router.message(StateFilter(None), F.text == M_EXP_SUMMARY)
+async def exp_summary_msg(msg: Message, db, user):
+    if not has_role(user, "manager"):
+        return
+    await msg.answer(expense_summary_text(db))
+    await msg.answer("Детальніше:", reply_markup=inline([[("📆 Витрати за минулий місяць", f"rep:exp:{_period('pmonth')[0]}:{_period('pmonth')[1]}"),
+                                                          ("📅 За цей місяць", f"rep:exp:{_period('month')[0]}:{_period('month')[1]}")]]))
 
 
 @router.message(StateFilter(None), F.text == M_EXP_ADD)

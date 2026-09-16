@@ -47,11 +47,26 @@ async def tasks_menu(msg: Message, state: FSMContext, db, user):
     await msg.answer(txt, reply_markup=main_menu(user["role"]))
     kb = [[(f"✅ №{t['id']}", f"task:done:{t['id']}") for t in rows[i:i + 3]] for i in range(0, min(len(rows), 12), 3)]
     if has_role(user, "manager"):
-        kb.append([("➕ Нове завдання", "task:new")])
+        kb.append([("➕ Нове завдання", "task:new"), ("✔️ Виконані", "task:done_list")])
         if rows:
             kb.append([(f"🗑 №{t['id']}", f"task:cancel:{t['id']}") for t in rows[:4]])
-    if kb:
-        await msg.answer("Дія:", reply_markup=inline(kb))
+    else:
+        kb.append([("✔️ Виконані", "task:done_list")])
+    await msg.answer("Дія:", reply_markup=inline(kb))
+
+
+@router.callback_query(F.data == "task:done_list")
+async def task_done_list(cb: CallbackQuery, db, user):
+    rows = S.done_tasks(db, 30, None if has_role(user, "manager") else user["telegram_id"])
+    if not rows:
+        await cb.message.answer("За останні 30 днів виконаних завдань немає.")
+    else:
+        txt = ["✔️ <b>Виконані за 30 днів</b>"]
+        for t in rows:
+            st = "✅" if t["status"] == "done" else "🗑"
+            txt.append(f"{st} №{t['id']} {t['text']} — {t['done_name'] or t['done_by']}, {local_dt_str(t['done_at'])}")
+        await cb.message.answer("\n".join(txt))
+    await cb.answer()
 
 
 @router.callback_query(F.data.startswith("task:done:"))

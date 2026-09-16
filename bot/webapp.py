@@ -184,7 +184,10 @@ async def today(body, user):
 async def tasks_list(body, user):
     db = get_db()
     rows = S.tasks_for(db, user["telegram_id"], user["role"])
-    return {"tasks": [{"id": t["id"], "text": t["text"], "due": t["due_date"], "assignee": t["assignee_name"] or ("усім" if t["assignee_id"] is None else str(t["assignee_id"])),
+    done = S.done_tasks(db, 14, None if user["role"] in ("admin", "manager") else user["telegram_id"])
+    return {"done": [{"id": t["id"], "text": t["text"], "by": t["done_name"] or str(t["done_by"]), "at": local_dt_str(t["done_at"]),
+                      "status": t["status"]} for t in done],
+            "tasks": [{"id": t["id"], "text": t["text"], "due": t["due_date"], "assignee": t["assignee_name"] or ("усім" if t["assignee_id"] is None else str(t["assignee_id"])),
                       "overdue": bool(t["due_date"] and t["due_date"] < today_local())} for t in rows]}
 
 
