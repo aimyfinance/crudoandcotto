@@ -10,15 +10,15 @@ from aiogram import F, Router
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import BufferedInputFile, CallbackQuery, FSInputFile, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, FSInputFile, InlineKeyboardButton, Message
 
 from .. import services as S
 from ..cash_import import parse_cash_report
 from ..config import TZ, settings
 from ..export import build_csv_movements, build_excel
-from ..keyboards import (CANCEL, M_DOCS_EXP, M_DOCS_PURCH, M_EXP_ADD, M_EXP_LIST, M_EXP_SUMMARY, M_REP_MONTH, M_REP_PERIOD, M_REP_TODAY,
+from ..keyboards import (CANCEL, M_DOCS_EXP, M_DOCS_PURCH, M_EXP_ADD, M_EXP_LIST, M_EXP_SUMMARY, M_PUR_SUMMARY, M_SALE_SUMMARY, M_REP_MONTH, M_REP_PERIOD, M_REP_TODAY,
                          M_REPORTS, M_SETTINGS, inline, main_menu, nav_kb, product_picker)
-from ..money import fmt_grams, fmt_money
+from ..money import fmt_grams, fmt_money, fmt_price
 from ..db import today_local, get_db
 from .common import Flow, has_role, parse_date, parse_period, ua_date
 
@@ -71,7 +71,33 @@ def _period(code: str) -> tuple[str, str]:
         first = today.replace(day=1)
         last_prev = first - dt.timedelta(days=1)
         return last_prev.replace(day=1).isoformat(), last_prev.isoformat()
+    if code == "year":
+        return today.replace(month=1, day=1).isoformat(), today.isoformat()
     return today.isoformat(), today.isoformat()
+
+
+PERIOD_CODES = ("today", "yday", "week", "month", "pmonth", "year")
+
+
+def prev_period(d1: str, d2: str) -> tuple[str, str]:
+    """Попередній період такої ж довжини (для місяця — попередній календарний місяць)."""
+    a, b = dt.date.fromisoformat(d1), dt.date.fromisoformat(d2)
+    if a.day == 1 and (b + dt.timedelta(days=1)).day == 1 and (b.year, b.month) == (a.year, a.month):
+        last_prev = a - dt.timedelta(days=1)
+        return last_prev.replace(day=1).isoformat(), last_prev.isoformat()
+    n = (b - a).days + 1
+    return (a - dt.timedelta(days=n)).isoformat(), (a - dt.timedelta(days=1)).isoformat()
+
+
+def period_label(d1: str, d2: str) -> str:
+    return ua_date(d1) if d1 == d2 else f"{ua_date(d1)} — {ua_date(d2)}"
+
+
+def period_kb_for(prefix: str):
+    """Універсальний вибір періоду; callback '<prefix>:<code>' або '<prefix>:custom'."""
+    return inline([[("Сьогодні", f"{prefix}:today"), ("Вчора", f"{prefix}:yday"), ("Тиждень", f"{prefix}:week")],
+                   [("Цей місяць", f"{prefix}:month"), ("Минулий місяць", f"{prefix}:pmonth"), ("Рік", f"{prefix}:year")],
+                   [("📆 Свій період", f"{prefix}:custom")]])
 
 
 def report_text(rep: dict) -> str:
@@ -104,10 +130,8 @@ def report_text(rep: dict) -> str:
     return "\n".join(out)
 
 
-def period_kb():
-    return inline([[("Сьогодні", "rep:today"), ("Вчора", "rep:yday")],
-                   [("Цей тиждень", "rep:week"), ("Цей місяць", "rep:month"), ("Минулий місяць", "rep:pmonth")],
-                   [("📆 Ввести період", "rep:custom")]])
+def period_kb(kind: str = "rep"):
+    return period_kb_for(kind)
 
 
 def export_kb(d1: str, d2: str):
@@ -121,7 +145,7 @@ async def reports(msg: Message, state: FSMContext, user):
         return await msg.answer("Звіти доступні менеджеру й адміністратору.")
     await state.clear()
     await msg.answer("📈 <b>Звіти</b> — оберіть період:", reply_markup=main_menu(user["role"]))
-    await msg.answer("Період:", reply_markup=period_kb())
+    await msg.answer("Період:", reply_markup=period_kb("rep"))
     await msg.answer("Витрати:", reply_markup=inline([[("➕ Додати витрату", "exp:add"), ("🗑 Останні витрати", "exp:list")]]))
 
 
@@ -140,31 +164,31 @@ async def rep_period_btn(msg: Message, state: FSMContext, user):
     await msg.answer("Введіть період: <code>01.09.2026 - 15.09.2026</code> або одну дату:", reply_markup=nav_kb(back=False))
 
 
-def expense_summary_text(db) -> str:
-    d1, d2 = _period("month")
-    p1, p2 = _period("pmonth")
+def expense_summary_text(db, d1: str, d2: str) -> str:
+    p1, p2 = prev_period(d1, d2)
     cur, prev = S.expenses_period(db, d1, d2), S.expenses_period(db, p1, p2)
     rep_cur, rep_prev = S.report_period(db, d1, d2), S.report_period(db, p1, p2)
-    mn = lambda iso: ["січень", "лютий", "березень", "квітень", "травень", "червень", "липень", "серпень", "вересень", "жовтень", "листопад", "грудень"][int(iso[5:7]) - 1]
-    out = [f"💸 <b>Витрати: {mn(d1)} (по {ua_date(d2)}) vs {mn(p1)}</b>"]
+    out = [f"💸 <b>Витрати за {period_label(d1, d2)}</b>  · порівняно з {period_label(p1, p2)}"]
     tot_c = sum(cur["by_type"].values(), Decimal(0))
     tot_p = sum(prev["by_type"].values(), Decimal(0))
     for t, label in S.EXP_TYPES.items():
         c, p = cur["by_type"][t], prev["by_type"][t]
         if c or p:
-            out.append(f"• {label}: <b>{fmt_money(c)}</b>  (мин. міс. {fmt_money(p)})")
-    out.append(f"Разом: <b>{fmt_money(tot_c)}</b>  (мин. міс. {fmt_money(tot_p)})")
+            out.append(f"• {label}: <b>{fmt_money(c)}</b>  (попер. {fmt_money(p)})")
+    if not tot_c and not tot_p:
+        out.append("Витрат за період немає.")
+    out.append(f"Разом: <b>{fmt_money(tot_c)}</b>  (попер. {fmt_money(tot_p)})")
     opex_c = cur["by_type"]["operating"] + cur["by_type"]["tax"]
     if rep_cur["revenue"]:
         out.append(f"Операційні + податки = {opex_c / rep_cur['revenue'] * 100:.0f} % виручки ({fmt_money(rep_cur['revenue'])})")
-    out.append(f"Операційний результат місяця: <b>{fmt_money(rep_cur['operating_result'])}</b>  (мин. міс. {fmt_money(rep_prev['operating_result'])})")
+    out.append(f"Операційний результат: <b>{fmt_money(rep_cur['operating_result'])}</b>  (попер. {fmt_money(rep_prev['operating_result'])})")
     top = sorted(((c, v) for (t, c), v in cur["by_category"].items() if t in ("operating", "tax")), key=lambda x: -x[1])[:6]
     if top:
-        out.append("\n<b>Найбільші операційні цього місяця</b>")
+        out.append("\n<b>Найбільші операційні за період</b>")
         prev_cat = {c: v for (t, c), v in prev["by_category"].items()}
         for c, v in top:
             pv = prev_cat.get(c)
-            out.append(f"• {c}: {fmt_money(v)}" + (f" (мин. {fmt_money(pv)})" if pv else ""))
+            out.append(f"• {c}: {fmt_money(v)}" + (f" (попер. {fmt_money(pv)})" if pv else ""))
     return "\n".join(out)
 
 
@@ -172,9 +196,109 @@ def expense_summary_text(db) -> str:
 async def exp_summary_msg(msg: Message, db, user):
     if not has_role(user, "manager"):
         return
-    await msg.answer(expense_summary_text(db))
-    await msg.answer("Детальніше:", reply_markup=inline([[("📆 Витрати за минулий місяць", f"rep:exp:{_period('pmonth')[0]}:{_period('pmonth')[1]}"),
-                                                          ("📅 За цей місяць", f"rep:exp:{_period('month')[0]}:{_period('month')[1]}")]]))
+    await msg.answer("📊 Резюме витрат — оберіть період:", reply_markup=period_kb_for("exps"))
+
+
+async def _send_exp_summary(msg: Message, db, d1: str, d2: str):
+    await msg.answer(expense_summary_text(db, d1, d2))
+    await msg.answer("Детальніше:", reply_markup=inline([[("📋 Розбивка по категоріях", f"rep:exp:{d1}:{d2}"), ("📈 Повний звіт", f"rep:full:{d1}:{d2}")],
+                                                         [("🔁 Інший період", "exps:menu")]]))
+
+
+@router.callback_query(F.data.startswith("exps:"))
+async def exp_summary_cb(cb: CallbackQuery, state: FSMContext, db, user):
+    code = cb.data.split(":")[1]
+    if code == "menu":
+        await cb.message.answer("Період:", reply_markup=period_kb_for("exps"))
+    elif code == "custom":
+        await state.set_state(Rep.period)
+        await state.update_data(period_target="exps")
+        await cb.message.answer("Введіть період: <code>01.08.2026 - 31.08.2026</code> або одну дату:", reply_markup=nav_kb(back=False))
+    elif code in PERIOD_CODES:
+        await _send_exp_summary(cb.message, db, *_period(code))
+    await cb.answer()
+
+
+# ---------------- резюме закупівель і продажів (той самий вибір періоду) ----------------
+
+def purchases_summary_text(db, d1: str, d2: str) -> str:
+    pu = S.purchases_period(db, d1, d2)
+    out = [f"📦 <b>Закупівлі за {period_label(d1, d2)}</b>"]
+    if not pu["count"]:
+        out.append("Закупівель за період немає.")
+        return "\n".join(out)
+    out.append(f"Документів: {pu['count']} · {fmt_grams(pu['grams'])} · товар <b>{fmt_money(pu['amount'])}</b>"
+               + (f" + транспорт/інше {fmt_money(pu['extra'])}" if pu["extra"] else ""))
+    if pu["grams"]:
+        out.append(f"Середня ціна з витратами: {fmt_price(((pu['amount'] + pu['extra']) * 1000 / pu['grams']).quantize(Decimal('0.01')))} €/кг")
+    out.append("\n<b>За постачальниками</b>")
+    for sup, (g, a, n) in sorted(pu["by_supplier"].items(), key=lambda x: -x[1][1]):
+        out.append(f"• {sup}: {n} док. · {fmt_grams(g)} · {fmt_money(a)}")
+    out.append("\n<b>Найбільше закуплено (€)</b>")
+    for r in pu["top"]:
+        out.append(f"• {r['name']}: {fmt_grams(int(r['g']))} · {fmt_money(Decimal(str(r['a'])))}")
+    if pu["count"] <= 12:
+        out.append("\n<b>Документи</b>")
+        for r in pu["rows"]:
+            out.append(f"• №{r['id']} {ua_date(r['doc_date'])} {r['supplier'] or ''} — {fmt_money(Decimal(str(r['amount'] or 0)))}" + (f" · {r['comment']}" if r["comment"] else ""))
+    return "\n".join(out)
+
+
+def sales_summary_text(db, d1: str, d2: str) -> str:
+    rep = S.report_period(db, d1, d2)
+    p1, p2 = prev_period(d1, d2)
+    prev = S.report_period(db, p1, p2)
+    out = [f"🛒 <b>Продажі за {period_label(d1, d2)}</b>  · порівняно з {period_label(p1, p2)}"]
+    if not rep["sales_count"]:
+        out.append("Продажів за період немає.")
+        return "\n".join(out)
+    avg = rep["revenue"] / rep["sales_count"]
+    out.append(f"Виручка: <b>{fmt_money(rep['revenue'])}</b>  (попер. {fmt_money(prev['revenue'])})")
+    out.append(f"Чеків: {rep['sales_count']} · середній чек {fmt_money(avg)} · продано {fmt_grams(rep['sold_grams'])}")
+    if rep["by_payment"]:
+        out.append("Оплата: " + ", ".join(f"{S.PAYMENTS[k].lower()} {fmt_money(v)}" for k, v in rep["by_payment"].items()))
+    out.append(f"Валовий прибуток: <b>{fmt_money(rep['gross_profit'])}</b> ({rep['gross_profit'] / rep['revenue'] * 100:.0f} %)")
+    days = S.sales_by_day(db, d1, d2)
+    if 1 < len(days) <= 31:
+        out.append("\n<b>По днях</b>")
+        for r in days:
+            out.append(f"• {ua_date(r['sale_date'])}: {fmt_money(Decimal(str(r['t'])))} ({r['n']} чек.)")
+    out.append("\n<b>Топ товарів</b> (виручка · маржа)")
+    for e in rep["by_product"][:10]:
+        out.append(f"• {e['name']}: {fmt_grams(e['grams'])} · {fmt_money(e['amount'])} · {e['margin_pct']:.0f} %")
+    return "\n".join(out)
+
+
+SUMMARY_KINDS = {"purs": ("📦 Резюме закупівель", purchases_summary_text), "sales": ("🛒 Резюме продажів", sales_summary_text)}
+
+
+async def _send_kind_summary(msg: Message, db, kind: str, d1: str, d2: str):
+    title, fn = SUMMARY_KINDS[kind]
+    await msg.answer(fn(db, d1, d2))
+    extra = [("📊 Excel", f"rep:xlsx:{d1}:{d2}"), ("🧾 Звірка з касою", f"rep:rec:{d1}:{d2}")] if kind == "sales" else [("📈 Повний звіт", f"rep:full:{d1}:{d2}")]
+    await msg.answer("Детальніше:", reply_markup=inline([extra, [("🔁 Інший період", f"{kind}:menu")]]))
+
+
+@router.message(StateFilter(None), F.text.in_({M_PUR_SUMMARY, M_SALE_SUMMARY}))
+async def kind_summary_msg(msg: Message, user):
+    if not has_role(user, "manager"):
+        return
+    kind = "purs" if msg.text == M_PUR_SUMMARY else "sales"
+    await msg.answer(f"{SUMMARY_KINDS[kind][0]} — оберіть період:", reply_markup=period_kb_for(kind))
+
+
+@router.callback_query(F.data.startswith("purs:") | F.data.startswith("sales:"))
+async def kind_summary_cb(cb: CallbackQuery, state: FSMContext, db, user):
+    kind, code = cb.data.split(":")[:2]
+    if code == "menu":
+        await cb.message.answer("Період:", reply_markup=period_kb_for(kind))
+    elif code == "custom":
+        await state.set_state(Rep.period)
+        await state.update_data(period_target=kind)
+        await cb.message.answer("Введіть період: <code>01.08.2026 - 31.08.2026</code> або одну дату:", reply_markup=nav_kb(back=False))
+    elif code in PERIOD_CODES:
+        await _send_kind_summary(cb.message, db, kind, *_period(code))
+    await cb.answer()
 
 
 @router.message(StateFilter(None), F.text == M_EXP_ADD)
@@ -219,24 +343,37 @@ async def rep_period(msg: Message, state: FSMContext, db, user):
     pr = parse_period(msg.text)
     if not pr:
         return await msg.answer("⚠️ Формат: 01.09.2026 - 15.09.2026")
+    target = (await state.get_data()).get("period_target")
     await state.clear()
+    if target == "exps":
+        return await _send_exp_summary(msg, db, *pr)
+    if target in SUMMARY_KINDS:
+        return await _send_kind_summary(msg, db, target, *pr)
     await _send_report(msg, db, user, *pr)
 
 
 async def _send_report(msg: Message, db, user, d1: str, d2: str):
     rep = S.report_period(db, d1, d2)
     await msg.answer(report_text(rep), reply_markup=main_menu(user["role"]))
-    await msg.answer("Експорт:", reply_markup=export_kb(d1, d2))
+    kb = export_kb(d1, d2)
+    kb.inline_keyboard.append([InlineKeyboardButton(text="🔁 Інший період", callback_data="rep:menu")])
+    await msg.answer("Експорт:", reply_markup=kb)
 
 
 @router.callback_query(F.data.startswith("rep:"))
-async def rep_cb(cb: CallbackQuery, db, user):
+async def rep_cb(cb: CallbackQuery, state: FSMContext, db, user):
     parts = cb.data.split(":")
     code = parts[1]
-    if code in ("today", "yday", "week", "month", "pmonth"):
+    if code == "menu":
+        await cb.answer()
+        return await cb.message.answer("Період:", reply_markup=period_kb())
+    if code in PERIOD_CODES:
         await cb.answer()
         return await _send_report(cb.message, db, user, *_period(code))
     d1, d2 = parts[2], parts[3]
+    if code == "full":
+        await cb.answer()
+        return await _send_report(cb.message, db, user, d1, d2)
     if code == "xlsx":
         await cb.answer("Готую Excel…")
         path = build_excel(db, d1, d2, Path("data/exports") / f"crudo_{d1}_{d2}.xlsx")

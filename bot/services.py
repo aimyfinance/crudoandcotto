@@ -703,6 +703,31 @@ def recent_writeoffs(db: Database, limit: int = 15):
                 "ORDER BY w.id DESC LIMIT ?", (limit,))
 
 
+def purchases_period(db: Database, date_from: str, date_to: str) -> dict:
+    rows = db.q("SELECT pu.id, pu.doc_date, pu.extra_costs, pu.comment, s.name AS supplier, "
+                "(SELECT SUM(grams) FROM purchase_lines pl WHERE pl.purchase_id=pu.id) AS grams, "
+                "(SELECT SUM(CAST(amount AS REAL)) FROM purchase_lines pl WHERE pl.purchase_id=pu.id) AS amount "
+                "FROM purchases pu LEFT JOIN suppliers s ON s.id=pu.supplier_id "
+                "WHERE pu.status='received' AND pu.doc_date BETWEEN ? AND ? ORDER BY pu.doc_date, pu.id", (date_from, date_to))
+    by_sup: dict[str, list] = {}
+    for r in rows:
+        e = by_sup.setdefault(r["supplier"] or "—", [0, ZERO, 0])
+        e[0] += r["grams"] or 0
+        e[1] += Decimal(str(r["amount"] or 0))
+        e[2] += 1
+    prods = db.q("SELECT p.name, SUM(pl.grams) g, SUM(CAST(pl.amount AS REAL)) a FROM purchase_lines pl "
+                 "JOIN purchases pu ON pu.id=pl.purchase_id JOIN products p ON p.id=pl.product_id "
+                 "WHERE pu.status='received' AND pu.doc_date BETWEEN ? AND ? GROUP BY p.id ORDER BY a DESC LIMIT 10", (date_from, date_to))
+    return {"rows": rows, "count": len(rows), "grams": sum(r["grams"] or 0 for r in rows),
+            "amount": sum((Decimal(str(r["amount"] or 0)) for r in rows), ZERO),
+            "extra": sum((d(r["extra_costs"]) for r in rows), ZERO), "by_supplier": by_sup, "top": prods}
+
+
+def sales_by_day(db: Database, date_from: str, date_to: str):
+    return db.q("SELECT sale_date, COUNT(*) n, SUM(CAST(total AS REAL)) t FROM sales WHERE status='done' AND sale_date BETWEEN ? AND ? "
+                "GROUP BY sale_date ORDER BY sale_date", (date_from, date_to))
+
+
 def recent_purchases(db: Database, limit: int = 15):
     return db.q("SELECT pu.*, s.name AS supplier_name FROM purchases pu LEFT JOIN suppliers s ON s.id=pu.supplier_id "
                 "ORDER BY pu.id DESC LIMIT ?", (limit,))
