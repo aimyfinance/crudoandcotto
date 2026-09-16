@@ -108,7 +108,7 @@ class OdooClient:
 
 WEIGHT_HINTS = ("weight", "gewicht", "peso", "kg", "gram")
 LINE_FIELDS_BASE = ["order_id", "product_id", "full_product_name", "qty", "price_subtotal_incl", "price_subtotal", "price_unit", "discount", "refunded_orderline_id"]
-ORDER_FIELDS_BASE = ["name", "pos_reference", "date_order", "state", "amount_total", "amount_paid", "config_id", "session_id", "payment_ids", "lines"]
+ORDER_FIELDS_BASE = ["name", "pos_reference", "date_order", "state", "amount_total", "amount_paid", "config_id", "session_id", "payment_ids", "statement_ids", "lines"]
 
 
 async def diagnose(client: OdooClient) -> dict:
@@ -127,6 +127,24 @@ async def diagnose(client: OdooClient) -> dict:
         weight = [k for k in fields if any(h in k.lower() or h in str(fields[k].get("string", "")).lower() for h in WEIGHT_HINTS)]
         out["weight_candidates"] = weight
         out["steps"].append("⚖️ кандидати поля ваги в рядку чека: " + (", ".join(f"{k} («{fields[k].get('string')}»)" for k in weight) or "не знайдено — вага може бути в qty"))
+    if out.get("pos.order.line"):
+        # повний перелік полів рядка (для пошуку ваги) і повний останній рядок
+        all_fields = await client.fields_get("pos.order.line")
+        out["line_field_list"] = sorted((k, str(v.get("string", ""))) for k, v in all_fields.items())
+        out["steps"].append("🧩 усі поля рядка чека: " + ", ".join(f"{k} «{lbl}»" for k, lbl in out["line_field_list"] if not k.startswith("__")))
+        last = await client.search_read("pos.order.line", [], list(all_fields.keys()), limit=1, order="id desc")
+        if last:
+            rec = {k: v for k, v in last[0].items() if v not in (None, False, 0, 0.0, "", [])}
+            out["last_line_full"] = rec
+            out["steps"].append("🔎 останній рядок повністю: " + "; ".join(f"{k}={v}" for k, v in rec.items()))
+    if out.get("pos.order"):
+        ofields_all = await client.fields_get("pos.order")
+        out["order_field_list"] = sorted(ofields_all.keys())
+        pay_like = [k for k in ofields_all if any(h in k for h in ("statement", "payment", "journal"))]
+        out["steps"].append("💳 поля оплати в чеку: " + (", ".join(pay_like) or "—"))
+        for m in ("account.bank.statement.line", "pos.payment.method", "account.journal"):
+            out[m] = await client.model_exists(m)
+            out["steps"].append(f"{'✅' if out[m] else '❌'} модель {m}")
     if out.get("pos.config"):
         cfgs = await client.search_read("pos.config", [], ["name"], limit=20)
         out["configs"] = [c["name"] for c in cfgs]
@@ -167,7 +185,9 @@ def _receipt_from_order(o: dict, lines: list[dict], payments: list[dict], weight
         pay = "card" if any(w in name for w in ("kart", "card", "bankomat", "kredit", "sumup", "terminal")) else "cash"
     number = str(o.get("pos_reference") or o.get("name") or o["id"])
     # у Octobox номер чека виглядає як «1452» або «Order 00001-001-0001» — беремо цифри в кінці
-    digits = "".join(ch for ch in number.split("-")[-1] if ch.isdigit()) or str(o["id"])
+    import re as _re
+    groups = _re.findall(r"\d+", number)
+    digits = groups[-1] if groups else str(o["id"])
     rlines = []
     for l in lines:
         amount = Decimal(str(l.get("price_subtotal_incl") if l.get("price_subtotal_incl") is not None else l.get("price_subtotal") or 0))
@@ -178,6 +198,9 @@ def _receipt_from_order(o: dict, lines: list[dict], payments: list[dict], weight
             grams = int(w if w >= 20 else w * 1000)   # >=20 → вже грами, інакше кг
         elif qty and qty != qty.to_integral():
             grams = int(qty * 1000)                   # дробова кількість = кг
+        elif l.get("price_unit") and amount and Decimal(str(l["price_unit"])) > amount * 3:
+            # ціна вказана за кг, а сума — за зважений шматок: вага = сума / ціна за кг
+            grams = int((amount / Decimal(str(l["price_unit"])) * 1000).quantize(Decimal("1")))
         name = l.get("full_product_name") or (l.get("product_id") or ["", ""])[1] or "?"
         rlines.append({"name": str(name).strip(), "group": None, "grams": grams, "amount": amount})
     total = sum((x["amount"] for x in rlines), Decimal(0))
@@ -200,11 +223,21 @@ async def fetch_receipts(client: OdooClient, since: dt.datetime, weight_field: s
     by_order: dict[int, list] = {}
     for l in all_lines:
         by_order.setdefault(l["order_id"][0], []).append(l)
-    pay_ids = [pid for o in orders for pid in (o.get("payment_ids") or [])]
-    pays = await client.search_read("pos.payment", [["id", "in", pay_ids]], ["amount", "payment_method_id", "pos_order_id"], limit=20000) if pay_ids else []
     pay_by_order: dict[int, list] = {}
-    for p in pays:
-        pay_by_order.setdefault(p["pos_order_id"][0], []).append(p)
+    pay_ids = [pid for o in orders for pid in (o.get("payment_ids") or [])]
+    if pay_ids:
+        pays = await client.search_read("pos.payment", [["id", "in", pay_ids]], ["amount", "payment_method_id", "pos_order_id"], limit=20000)
+        for p in pays:
+            pay_by_order.setdefault(p["pos_order_id"][0], []).append(p)
+    else:
+        # Odoo 10–12: оплати — рядки банківської виписки чека, спосіб = журнал (Bar / Karte)
+        st_ids = [sid for o in orders for sid in (o.get("statement_ids") or [])]
+        if st_ids:
+            sts = await client.search_read("account.bank.statement.line", [["id", "in", st_ids]], ["amount", "journal_id", "pos_statement_id"], limit=20000)
+            for p in sts:
+                oid = (p.get("pos_statement_id") or [None])[0]
+                if oid:
+                    pay_by_order.setdefault(oid, []).append({"amount": p["amount"], "payment_method_id": p.get("journal_id")})
     return [_receipt_from_order(o, by_order.get(o["id"], []), pay_by_order.get(o["id"], []), weight_field, tz) for o in orders]
 
 
