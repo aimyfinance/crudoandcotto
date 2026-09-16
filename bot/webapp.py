@@ -96,7 +96,9 @@ def _today(db):
     rep = S.report_period(db, t, t)
     sales = [{"id": s["id"], "time": local_dt_str(s["sold_at"])[-5:], "total": str(d(s["total"])),
               "payment": s["payment_method"], "status": s["status"]} for s in S.recent_sales(db, 30, date=t)]
+    sh = S.current_shift(db)
     return {
+        "shift": {"open": bool(sh), "opened_at": local_dt_str(sh["opened_at"])[-5:] if sh else None, "by": sh["opened_name"] if sh else None},
         "date": t, "revenue": str(rep["revenue"]), "gross_profit": str(rep["gross_profit"]),
         "sales_count": rep["sales_count"], "sold_grams": rep["sold_grams"],
         "by_payment": {k: str(v) for k, v in rep["by_payment"].items()},
@@ -178,6 +180,35 @@ async def today(body, user):
     return {"today": _today(get_db()), "products": _products_with_stock(get_db())}
 
 
+@api
+async def shift_toggle(body, user):
+    db = get_db()
+    import datetime as _dt
+    from .config import TZ as _TZ
+    now = _dt.datetime.now(_TZ).strftime("%H:%M")
+    if body.get("action") == "open":
+        sid = S.open_shift(db, user["telegram_id"])
+        msg = f"▶️ Каса відкрита о {now} — {user['name'] or user['telegram_id']} (Mini App)" if sid else None
+    else:
+        s = S.close_shift(db, user["telegram_id"])
+        rep = S.report_period(db, today_local(), today_local())
+        msg = (f"⏹ Каса закрита о {now} — {user['name'] or user['telegram_id']} (Mini App)\n"
+               f"Продажів у боті: {rep['sales_count']} · виручка {rep['revenue']} €") if s else None
+    if msg:
+        bot = request_bot.get("bot")
+        if bot:
+            for uid in S.notify_targets(db, "manager"):
+                if uid != user["telegram_id"]:
+                    try:
+                        await bot.send_message(uid, msg)
+                    except Exception:
+                        pass
+    return {"today": _today(db)}
+
+
+request_bot: dict = {}   # головний модуль кладе сюди екземпляр Bot для сповіщень
+
+
 async def index(request: web.Request):
     html = (STATIC / "index.html").read_text(encoding="utf-8")
     return web.Response(text=html, content_type="text/html", headers={"Cache-Control": "no-store"})
@@ -198,4 +229,5 @@ def build_app() -> web.Application:
     app.router.add_post("/api/sale/detail", sale_detail)
     app.router.add_post("/api/stock", stock)
     app.router.add_post("/api/today", today)
+    app.router.add_post("/api/shift", shift_toggle)
     return app

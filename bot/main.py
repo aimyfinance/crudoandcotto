@@ -13,7 +13,7 @@ from aiogram.types import BotCommand, FSInputFile, MenuButtonWebApp, WebAppInfo
 from . import services as S
 from .config import TZ, settings
 from .db import get_db
-from .handlers import adjustments, catalog, common, purchases, reports, sales
+from .handlers import adjustments, catalog, common, purchases, reports, sales, tasks
 
 log = logging.getLogger("crudo")
 
@@ -24,7 +24,7 @@ def build_dispatcher() -> Dispatcher:
     dp.message.outer_middleware(common.AuthMiddleware())
     dp.callback_query.outer_middleware(common.AuthMiddleware())
     # порядок важливий: спочатку сценарії зі станами, common (скасування) — першим
-    dp.include_routers(common.router, sales.router, purchases.router, catalog.router, adjustments.router, reports.router)
+    dp.include_routers(common.router, sales.router, purchases.router, catalog.router, adjustments.router, reports.router, tasks.router)
     return dp
 
 
@@ -44,6 +44,16 @@ async def daily_backup(bot: Bot) -> None:
             await bot.send_document(chat_id, FSInputFile(path), caption=f"💾 Щоденна резервна копія {dt.datetime.now(TZ):%d.%m.%Y}")
         except Exception:
             log.exception("backup failed")
+
+
+async def minute_loop(bot: Bot) -> None:
+    """Щохвилини: нагадування про касу за графіком і прострочені завдання."""
+    while True:
+        try:
+            await tasks.shift_watchdog(bot)
+        except Exception:
+            log.exception("watchdog failed")
+        await asyncio.sleep(60 - dt.datetime.now().second)
 
 
 async def web_server() -> None:
@@ -66,6 +76,8 @@ async def main() -> None:
     S.ensure_admins(db, settings.admin_ids)
     bot = Bot(settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = build_dispatcher()
+    from . import webapp as _webapp
+    _webapp.request_bot["bot"] = bot
     await bot.set_my_commands([BotCommand(command="menu", description="Головне меню"),
                                BotCommand(command="id", description="Мій Telegram ID"),
                                BotCommand(command="help", description="Довідка"),
@@ -77,6 +89,7 @@ async def main() -> None:
         except Exception as e:  # некоректний WEBAPP_URL не має зупиняти бота
             log.warning("не вдалося встановити кнопку меню Mini App (%s): %s", settings.webapp_url, e)
     asyncio.create_task(daily_backup(bot))
+    asyncio.create_task(minute_loop(bot))
     log.info("bot started, db=%s", settings.db_path)
     await bot.delete_webhook(drop_pending_updates=False)
     await dp.start_polling(bot, allowed_updates=["message", "callback_query"])

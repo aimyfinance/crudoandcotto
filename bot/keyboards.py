@@ -21,13 +21,16 @@ M_WRITEOFF = "✂️ Списання / коригування"
 M_HISTORY = "🕘 Історія"
 M_REPORTS = "📈 Звіти"
 M_SETTINGS = "⚙️ Налаштування"
+M_TASKS = "📋 Завдання"
+M_SHIFT_OPEN = "▶️ Відкрити касу"
+M_SHIFT_CLOSE = "⏹ Закрити касу"
 
 ROLE_MENUS = {
-    "admin": [[M_SALE, M_PURCHASE], [M_STOCK, M_PRODUCTS], [M_BATCHES, M_WRITEOFF], [M_HISTORY, M_REPORTS], [M_SETTINGS]],
-    "manager": [[M_SALE, M_PURCHASE], [M_STOCK, M_PRODUCTS], [M_BATCHES, M_WRITEOFF], [M_HISTORY, M_REPORTS]],
-    "seller": [[M_SALE, M_STOCK], [M_HISTORY]],
+    "admin": [[M_SALE, M_PURCHASE], [M_STOCK, M_PRODUCTS], [M_BATCHES, M_WRITEOFF], [M_HISTORY, M_REPORTS], [M_TASKS, M_SETTINGS]],
+    "manager": [[M_SALE, M_PURCHASE], [M_STOCK, M_PRODUCTS], [M_BATCHES, M_WRITEOFF], [M_HISTORY, M_REPORTS], [M_TASKS, M_SETTINGS]],
+    "seller": [[M_SALE, M_STOCK], [M_HISTORY, M_TASKS]],
 }
-MENU_BUTTONS = {M_SALE, M_PURCHASE, M_STOCK, M_PRODUCTS, M_BATCHES, M_WRITEOFF, M_HISTORY, M_REPORTS, M_SETTINGS}
+MENU_BUTTONS = {M_SALE, M_PURCHASE, M_STOCK, M_PRODUCTS, M_BATCHES, M_WRITEOFF, M_HISTORY, M_REPORTS, M_SETTINGS, M_TASKS}
 
 
 M_APP = "🧾 Відкрити касу"
@@ -35,8 +38,15 @@ M_APP = "🧾 Відкрити касу"
 
 def main_menu(role: str) -> ReplyKeyboardMarkup:
     rows = [[KeyboardButton(text=t) for t in r] for r in ROLE_MENUS.get(role, ROLE_MENUS["seller"])]
+    try:
+        from .db import get_db
+        shift_btn = M_SHIFT_CLOSE if S.current_shift(get_db()) else M_SHIFT_OPEN
+    except Exception:
+        shift_btn = M_SHIFT_OPEN
+    first = [KeyboardButton(text=shift_btn)]
     if settings.webapp_url:
-        rows.insert(0, [KeyboardButton(text=M_APP, web_app=WebAppInfo(url=settings.webapp_url + "/app"))])
+        first.insert(0, KeyboardButton(text=M_APP, web_app=WebAppInfo(url=settings.webapp_url + "/app")))
+    rows.insert(0, first)
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 

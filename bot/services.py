@@ -867,3 +867,107 @@ def reconcile(db: Database, date_from: str, date_to: str) -> list[dict]:
         out.append({"day": day, **e, "bot_total": bot_total, "reg_total": reg_total,
                     "diff": (bot_total - reg_total) if reg_total is not None else None})
     return out
+
+
+# ======================= налаштування (в базі) =======================
+
+def setting_get(db: Database, key: str, default: str = "") -> str:
+    r = db.one("SELECT value FROM app_settings WHERE key=?", (key,))
+    return r["value"] if r else default
+
+
+def setting_set(db: Database, key: str, value: str) -> None:
+    with db.tx() as c:
+        c.execute("INSERT INTO app_settings(key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+
+
+# ======================= завдання =======================
+
+def create_task(db: Database, user_id: int, text: str, assignee_id: int | None, due_date: str | None) -> int:
+    with db.tx() as c:
+        tid = c.execute("INSERT INTO tasks(text, assignee_id, created_by, created_at, due_date, status) VALUES (?,?,?,?,?,'open')",
+                        (text.strip(), assignee_id, user_id, now_utc(), due_date)).lastrowid
+        audit(c, user_id, "task.create", {"task_id": tid})
+        return tid
+
+
+def tasks_for(db: Database, user_id: int, role: str):
+    """Відкриті завдання: свої + «усім»; менеджер/адмін бачить усі відкриті."""
+    if role in ("admin", "manager"):
+        return db.q("SELECT t.*, u.name AS assignee_name FROM tasks t LEFT JOIN users u ON u.telegram_id=t.assignee_id "
+                    "WHERE t.status='open' ORDER BY COALESCE(t.due_date,'9999'), t.id")
+    return db.q("SELECT t.*, u.name AS assignee_name FROM tasks t LEFT JOIN users u ON u.telegram_id=t.assignee_id "
+                "WHERE t.status='open' AND (t.assignee_id=? OR t.assignee_id IS NULL) ORDER BY COALESCE(t.due_date,'9999'), t.id", (user_id,))
+
+
+def task_done(db: Database, task_id: int, user_id: int) -> dict | None:
+    with db.tx() as c:
+        t = c.execute("SELECT * FROM tasks WHERE id=? AND status='open'", (task_id,)).fetchone()
+        if not t:
+            return None
+        c.execute("UPDATE tasks SET status='done', done_at=?, done_by=? WHERE id=?", (now_utc(), user_id, task_id))
+        audit(c, user_id, "task.done", {"task_id": task_id})
+        return dict(t)
+
+
+def task_cancel(db: Database, task_id: int, user_id: int) -> None:
+    with db.tx() as c:
+        c.execute("UPDATE tasks SET status='cancelled', done_at=?, done_by=? WHERE id=? AND status='open'", (now_utc(), user_id, task_id))
+
+
+def overdue_tasks(db: Database, today: str):
+    return db.q("SELECT t.*, u.name AS assignee_name FROM tasks t LEFT JOIN users u ON u.telegram_id=t.assignee_id "
+                "WHERE t.status='open' AND t.due_date IS NOT NULL AND t.due_date<=? ORDER BY t.due_date", (today,))
+
+
+# ======================= зміни каси =======================
+
+def open_shift(db: Database, user_id: int, cash_start: Decimal | None = None) -> int | None:
+    """Повертає id нової зміни або None, якщо зміна вже відкрита."""
+    with db.tx() as c:
+        if c.execute("SELECT 1 FROM shifts WHERE closed_at IS NULL").fetchone():
+            return None
+        sid = c.execute("INSERT INTO shifts(shift_date, opened_at, opened_by, cash_start) VALUES (?,?,?,?)",
+                        (today_local(), now_utc(), user_id, str(cash_start) if cash_start is not None else None)).lastrowid
+        audit(c, user_id, "shift.open", {"shift_id": sid})
+        return sid
+
+
+def close_shift(db: Database, user_id: int, cash_end: Decimal | None = None, note: str | None = None):
+    with db.tx() as c:
+        s = c.execute("SELECT * FROM shifts WHERE closed_at IS NULL ORDER BY id DESC LIMIT 1").fetchone()
+        if not s:
+            return None
+        c.execute("UPDATE shifts SET closed_at=?, closed_by=?, cash_end=?, note=? WHERE id=?",
+                  (now_utc(), user_id, str(cash_end) if cash_end is not None else None, note, s["id"]))
+        audit(c, user_id, "shift.close", {"shift_id": s["id"]})
+        return dict(s)
+
+
+def current_shift(db: Database):
+    return db.one("SELECT s.*, u.name AS opened_name FROM shifts s LEFT JOIN users u ON u.telegram_id=s.opened_by WHERE s.closed_at IS NULL ORDER BY s.id DESC LIMIT 1")
+
+
+def shifts_on(db: Database, day: str):
+    return db.q("SELECT * FROM shifts WHERE shift_date=? ORDER BY id", (day,))
+
+
+# ======================= документи =======================
+
+def add_document(db: Database, user_id: int, kind: str, ref_id: int | None, file_name: str, path: str) -> int:
+    with db.tx() as c:
+        return c.execute("INSERT INTO documents(kind, ref_id, file_name, path, uploaded_by, uploaded_at) VALUES (?,?,?,?,?,?)",
+                         (kind, ref_id, file_name, path, user_id, now_utc())).lastrowid
+
+
+def list_documents(db: Database, kind: str, limit: int = 15):
+    return db.q("SELECT * FROM documents WHERE kind=? ORDER BY id DESC LIMIT ?", (kind, limit))
+
+
+def get_document(db: Database, doc_id: int):
+    return db.one("SELECT * FROM documents WHERE id=?", (doc_id,))
+
+
+def notify_targets(db: Database, min_role: str = "manager") -> list[int]:
+    roles = ("admin", "manager") if min_role == "manager" else ("admin",)
+    return [r["telegram_id"] for r in db.q(f"SELECT telegram_id FROM users WHERE active=1 AND role IN ({','.join('?' * len(roles))})", roles)]

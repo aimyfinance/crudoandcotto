@@ -50,6 +50,7 @@ class Exp(StatesGroup):
     category = State()
     amount = State()
     comment = State()
+    photo = State()
 
 
 # ---------------- періоди ----------------
@@ -282,9 +283,32 @@ async def exp_comment(msg: Message, state: FSMContext, db, user):
     data = await state.get_data()
     comment = None if msg.text.startswith("⏭") else msg.text.strip()[:120]
     eid = S.add_expense(db, user["telegram_id"], data["op_date"], data["exp_type"], data["category"], Decimal(data["amount"]), comment)
+    await state.update_data(exp_id=eid)
+    await state.set_state(Exp.photo)
+    await msg.answer(f"✅ Витрату №{eid} записано: {S.EXP_TYPES[data['exp_type']]} · {data['category']} · {fmt_money(data['amount'])} · {ua_date(data['op_date'])}\n"
+                     "📎 Надішліть фото чека/рахунку для архіву або пропустіть:", reply_markup=nav_kb("⏭ Пропустити", back=False))
+
+
+@router.message(StateFilter(Exp.photo), F.photo | F.document)
+async def exp_photo(msg: Message, state: FSMContext, db, user):
+    from .tasks import save_document
+    data = await state.get_data()
+    buf = io.BytesIO()
+    if msg.document:
+        await msg.bot.download(msg.document, destination=buf)
+        name = msg.document.file_name or "receipt"
+    else:
+        await msg.bot.download(msg.photo[-1], destination=buf)
+        name = "receipt.jpg"
+    save_document(db, user["telegram_id"], "expense", data["exp_id"], name, buf.getvalue())
     await state.clear()
-    await msg.answer(f"✅ Витрату №{eid} записано: {S.EXP_TYPES[data['exp_type']]} · {data['category']} · {fmt_money(data['amount'])} · {ua_date(data['op_date'])}",
-                     reply_markup=main_menu(user["role"]))
+    await msg.answer("📁 Чек збережено в архів витрат.", reply_markup=main_menu(user["role"]))
+
+
+@router.message(StateFilter(Exp.photo), F.text)
+async def exp_photo_skip(msg: Message, state: FSMContext, user):
+    await state.clear()
+    await msg.answer("Гаразд, без документа.", reply_markup=main_menu(user["role"]))
 
 
 @router.callback_query(F.data == "exp:list")
@@ -332,7 +356,7 @@ async def reset_db_confirm(msg: Message, state: FSMContext, db, user):
 # ---------------- налаштування ----------------
 
 def settings_kb(user):
-    rows = [[("👥 Користувачі", "set:users")]]
+    rows = [[("👥 Користувачі", "set:users"), ("🕘 Графік ярмарків", "set:schedule")], [("📁 Документи", "set:docs")]]
     if user["role"] == "admin":
         rows += [[("➕ Додати користувача", "set:adduser")],
                  [("💾 Резервна копія зараз", "set:backup"), ("♻️ Відновити з файлу", "set:restore")],

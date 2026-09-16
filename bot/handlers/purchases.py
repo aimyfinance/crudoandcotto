@@ -331,7 +331,9 @@ async def inv_file(msg: Message, state: FSMContext, db, user):
         draft = build_draft(parsed)
     except Exception as e:
         return await msg.answer(f"⚠️ Не вдалося розпізнати: {e}")
-    await state.update_data(draft=draft, inv_bytes=buf.getvalue().hex()[:0])  # файл не зберігаємо в стані (обсяг)
+    import base64
+    await state.update_data(draft=draft, inv_b64=base64.b64encode(buf.getvalue()).decode(),
+                            inv_name=(msg.document.file_name if msg.document else f"invoice_{today_local()}.jpg"))
     await state.set_state(Inv.review)
     await _inv_review(msg, state)
 
@@ -495,11 +497,19 @@ async def inv_transport_val(msg: Message, state: FSMContext):
 @router.callback_query(StateFilter(Inv.review), F.data == "inv:post")
 async def inv_post(cb: CallbackQuery, state: FSMContext, db, user):
     from ..invoice import post_draft
-    d = (await state.get_data())["draft"]
+    data = await state.get_data()
+    d = data["draft"]
     try:
         pid = post_draft(d, user["telegram_id"])
     except ValueError as e:
         return await cb.answer(str(e), show_alert=True)
+    if data.get("inv_b64"):
+        import base64
+        from .tasks import save_document
+        try:
+            save_document(db, user["telegram_id"], "purchase", pid, data.get("inv_name") or "invoice.pdf", base64.b64decode(data["inv_b64"]))
+        except Exception:
+            pass
     n = sum(1 for l in d["lines"] if l["product_id"] and l["grams"] and l["price"] and not l.get("skip"))
     skipped = len(d["lines"]) - n
     await state.clear()

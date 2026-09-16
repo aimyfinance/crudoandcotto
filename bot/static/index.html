@@ -314,11 +314,20 @@ function openBatches(id){
 }
 
 /* ---------------- Сьогодні ---------------- */
+async function shift(action){
+  if(!confirm(action==='open'?'Відкрити касу?':'Закрити касу? Керівник отримає підсумок дня.')) return;
+  try{ const r=await api('shift',{action}); state.today=r.today; render(); toast(action==='open'?'Касу відкрито':'Касу закрито'); hap('medium'); }
+  catch(e){ toast(e.message,true); }
+}
 async function refreshToday(){ try{ const r=await api('today'); state.today=r.today; state.products=r.products; render(); }catch(e){ toast(e.message,true); } }
 function viewToday(){
   const t=state.today; if(!t) return `<div class="loading">…</div>`;
   const max = Math.max(1,...t.top.map(x=>Number(x.amount)));
-  return `<div class="stats">
+  const sh = t.shift||{};
+  return `<div class="row" style="margin:0 0 12px">${sh.open
+      ? `<button class="btn red" onclick="shift('close')">⏹ Закрити касу <span class="sub">(відкрита ${sh.opened_at}${sh.by?' · '+sh.by:''})</span></button>`
+      : `<button class="btn board" onclick="shift('open')">▶️ Відкрити касу</button>`}</div>
+    <div class="stats">
       <div class="stat"><div class="n">${eur(t.revenue)}</div><div class="l">виручка</div></div>
       <div class="stat"><div class="n">${eur(t.gross_profit)}</div><div class="l">валовий прибуток</div></div>
       <div class="stat"><div class="n">${eur(t.by_payment.cash||0)}</div><div class="l">готівка</div></div>
