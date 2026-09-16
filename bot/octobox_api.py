@@ -184,11 +184,25 @@ async def diagnose(client: OdooClient) -> dict:
         if orders and out.get("pos.order.line"):
             lf = await client.fields_get("pos.order.line")
             wantl = [f for f in LINE_FIELDS_BASE if f in lf] + [w for w in out.get("weight_candidates", []) if w in lf]
-            lines = await client.search_read("pos.order.line", [["order_id", "=", orders[0]["id"]]], wantl, limit=20)
+            wantl = list(dict.fromkeys(wantl + [f for f in ("price_unit", "discount", "pack_lot_ids", "product_id") if f in lf]))
+            lines = await client.search_read("pos.order.line", [["order_id", "in", [o["id"] for o in orders]]], wantl, limit=30)
             out["sample_lines"] = lines
-            out["steps"].append("📄 рядки останнього чека: " + "; ".join(
-                f"{l.get('full_product_name') or (l.get('product_id') or ['', ''])[1]} qty={l.get('qty')} {l.get('price_subtotal_incl')} €"
-                + "".join(f" {w}={l.get(w)}" for w in out.get("weight_candidates", []) if l.get(w) not in (None, 0, False)) for l in lines))
+            lot_ids = [x for l in lines for x in (l.get("pack_lot_ids") or [])]
+            lots = {}
+            if lot_ids and await client.model_exists("pos.pack.operation.lot"):
+                for lt in await client.search_read("pos.pack.operation.lot", [["id", "in", lot_ids]], ["lot_name", "pos_order_line_id"], limit=100):
+                    lots.setdefault((lt.get("pos_order_line_id") or [None])[0], []).append(lt.get("lot_name"))
+            prod_ids = list({(l.get("product_id") or [None])[0] for l in lines if l.get("product_id")})
+            prices = {}
+            if prod_ids:
+                try:
+                    for pr in await client.search_read("product.product", [["id", "in", prod_ids]], ["name", "lst_price", "uom_id"], limit=100):
+                        prices[pr["id"]] = (pr.get("lst_price"), (pr.get("uom_id") or ["", ""])[1])
+                except OdooError as e:
+                    out["steps"].append(f"⚠️ product.product: {e}")
+            out["steps"].append("📄 рядки останніх 3 чеків (товар · qty · сума · price_unit · знижка · лот · ціна товару/од.): " + "; ".join(
+                f"{l.get('full_product_name') or (l.get('product_id') or ['', ''])[1]} · {l.get('qty')} · {l.get('price_subtotal_incl')} € · pu={l.get('price_unit')} · d={l.get('discount')}"
+                f" · lot={lots.get(l['id'])} · list={prices.get((l.get('product_id') or [None])[0])}" for l in lines))
         if orders and out.get("pos.payment") and orders[0].get("payment_ids"):
             pays = await client.search_read("pos.payment", [["id", "in", orders[0]["payment_ids"]]], ["amount", "payment_method_id"], limit=10)
             out["sample_payments"] = pays
@@ -229,9 +243,22 @@ def _receipt_from_order(o: dict, lines: list[dict], payments: list[dict], weight
             grams = int(w if w >= 20 else w * 1000)   # >=20 → вже грами, інакше кг
         elif qty and qty != qty.to_integral():
             grams = int(qty * 1000)                   # дробова кількість = кг
-        elif l.get("price_unit") and amount and Decimal(str(l["price_unit"])) > amount * 3:
-            # ціна вказана за кг, а сума — за зважений шматок: вага = сума / ціна за кг
-            grams = int((amount / Decimal(str(l["price_unit"])) * 1000).quantize(Decimal("1")))
+        else:
+            grams = _weight_from_lots(l.get("_lots") or [])
+            if not grams:
+                gross = amount
+                disc = Decimal(str(l.get("discount") or 0))
+                if disc:
+                    gross = amount / (1 - disc / 100)   # сума до знижки — щоб ділити на ціну за кг
+                per_kg = None
+                pu = Decimal(str(l.get("price_unit") or 0))
+                lp = Decimal(str(l.get("_list_price") or 0))
+                if pu and pu > gross * 2:              # price_unit — це ціна за кг
+                    per_kg = pu
+                elif lp and lp > gross * 2:            # інакше — прайсова ціна товару за кг
+                    per_kg = lp
+                if per_kg and amount > 0:
+                    grams = int((gross / per_kg * 1000).quantize(Decimal("1")))
         name = l.get("full_product_name") or (l.get("product_id") or ["", ""])[1] or "?"
         rlines.append({"name": str(name).strip(), "group": None, "grams": grams, "amount": amount})
     total = sum((x["amount"] for x in rlines), Decimal(0))
@@ -241,16 +268,35 @@ def _receipt_from_order(o: dict, lines: list[dict], payments: list[dict], weight
 async def fetch_receipts(client: OdooClient, since: dt.datetime, weight_field: str | None, pos_config: str | None, tz) -> list[dict]:
     domain = [["date_order", ">=", since.astimezone(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")],
               ["state", "in", ["paid", "done", "invoiced"]]]
-    if pos_config:
-        domain.append(["config_id.name", "=", pos_config])
+    # каса — за внутрішнім ID (назва «K01» спільна для всіх клієнтів Octobox на одному сервері)
+    cfgs = await client.search_read("pos.config", [["name", "=", pos_config]] if pos_config else [], ["name"], limit=10)
+    if cfgs:
+        domain.append(["config_id", "in", [c["id"] for c in cfgs]])
     ofields = await client.fields_get("pos.order")
     want = [f for f in ORDER_FIELDS_BASE if f in ofields]
     orders = await client.search_read("pos.order", domain, want, limit=2000, order="date_order asc")
     if not orders:
         return []
     lf = await client.fields_get("pos.order.line")
-    wantl = [f for f in LINE_FIELDS_BASE if f in lf] + ([weight_field] if weight_field and weight_field in lf else [])
+    wantl = list(dict.fromkeys([f for f in LINE_FIELDS_BASE if f in lf] + [f for f in ("pack_lot_ids",) if f in lf]
+                               + ([weight_field] if weight_field and weight_field in lf else [])))
     all_lines = await client.search_read("pos.order.line", [["order_id", "in", [o["id"] for o in orders]]], wantl, limit=20000)
+    # лоти (касові ваги нерідко пишуть туди грами) і ціни товарів (€/кг) — для обчислення ваги
+    lot_ids = [x for l in all_lines for x in (l.get("pack_lot_ids") or [])]
+    if lot_ids and await client.model_exists("pos.pack.operation.lot"):
+        lots: dict[int, list] = {}
+        for lt in await client.search_read("pos.pack.operation.lot", [["id", "in", lot_ids]], ["lot_name", "pos_order_line_id"], limit=20000):
+            lots.setdefault((lt.get("pos_order_line_id") or [None])[0], []).append(lt.get("lot_name"))
+        for l in all_lines:
+            l["_lots"] = lots.get(l["id"], [])
+    prod_ids = list({(l.get("product_id") or [None])[0] for l in all_lines if l.get("product_id")})
+    if prod_ids:
+        try:
+            prices = {pr["id"]: pr.get("lst_price") for pr in await client.search_read("product.product", [["id", "in", prod_ids]], ["lst_price"], limit=5000)}
+            for l in all_lines:
+                l["_list_price"] = prices.get((l.get("product_id") or [None])[0])
+        except OdooError:
+            pass
     by_order: dict[int, list] = {}
     for l in all_lines:
         by_order.setdefault(l["order_id"][0], []).append(l)
@@ -270,6 +316,22 @@ async def fetch_receipts(client: OdooClient, since: dt.datetime, weight_field: s
                 if oid:
                     pay_by_order.setdefault(oid, []).append({"amount": p["amount"], "payment_method_id": p.get("journal_id")})
     return [_receipt_from_order(o, by_order.get(o["id"], []), pay_by_order.get(o["id"], []), weight_field, tz) for o in orders]
+
+
+def _weight_from_lots(lots: list) -> int:
+    """Лот виду '110', '0.110', '110 g', '0,11 kg' → грами."""
+    import re as _re
+    for name in lots:
+        m = _re.search(r"(\d+(?:[.,]\d+)?)\s*(kg|g|гр|г)?", str(name or ""), _re.I)
+        if not m:
+            continue
+        v = Decimal(m.group(1).replace(",", "."))
+        unit = (m.group(2) or "").lower()
+        if unit == "kg" or (not unit and v < 20):
+            v *= 1000
+        if 0 < v < 100000:
+            return int(v)
+    return 0
 
 
 def config() -> dict:
