@@ -260,7 +260,8 @@ def _receipt_from_order(o: dict, lines: list[dict], payments: list[dict], weight
                 if per_kg and amount > 0:
                     grams = int((gross / per_kg * 1000).quantize(Decimal("1")))
         name = l.get("full_product_name") or (l.get("product_id") or ["", ""])[1] or "?"
-        rlines.append({"name": str(name).strip(), "group": None, "grams": grams, "amount": amount})
+        rlines.append({"name": str(name).strip(), "group": None, "grams": grams, "amount": amount,
+                       "discount": Decimal(str(l.get("discount") or 0))})
     total = sum((x["amount"] for x in rlines), Decimal(0))
     return {"number": digits, "dt": d, "payment": pay, "refund": total < 0 or str(o.get("state")) == "cancel", "lines": rlines, "odoo_id": o["id"]}
 

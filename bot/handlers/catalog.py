@@ -262,11 +262,12 @@ def product_card(p) -> str:
     pg = f" · упаковка {p['piece_grams']} г" if p["sale_mode"] == "piece" else ""
     st = "" if p["active"] else " · <i>архів</i>"
     sku = f" · арт. {p['sku']}" if p["sku"] else ""
-    return f"<b>{p['name']}</b>{st}\n{S.CATEGORIES[p['category']]} · {MODE_UA[p['sale_mode']]}{pg}{sku}\nРоздрібна ціна: <b>{fmt_price(p['retail_price'])} €/{unit}</b>"
+    reg = f"\nЦіна каси Octobox: {fmt_price(p['register_price'])} €/кг" if p["register_price"] else ""
+    return f"<b>{p['name']}</b>{st}\n{S.CATEGORIES[p['category']]} · {MODE_UA[p['sale_mode']]}{pg}{sku}\nРоздрібна ціна: <b>{fmt_price(p['retail_price'])} €/{unit}</b>{reg}"
 
 
 def product_kb(p):
-    rows = [[("💶 Ціна", f"prod:price:{p['id']}"), ("✏️ Назва", f"prod:name:{p['id']}")],
+    rows = [[("💶 Ціна", f"prod:price:{p['id']}"), ("🧾 Ціна каси/кг", f"prod:reg:{p['id']}"), ("✏️ Назва", f"prod:name:{p['id']}")],
             [("📦 Упаковка, г", f"prod:pg:{p['id']}"), ("🔢 Артикул", f"prod:sku:{p['id']}")],
             [("🗄 В архів" if p["active"] else "♻️ Відновити", f"prod:toggle:{p['id']}")]]
     return inline(rows)
@@ -416,7 +417,8 @@ async def p_sku(msg: Message, state: FSMContext, db, user):
 
 # --- редагування полів картки ---
 
-EDIT_PROMPTS = {"price": "Нова роздрібна ціна, €:", "name": "Нова назва:", "pg": "Вага упаковки, г:", "sku": "Артикул:"}
+EDIT_PROMPTS = {"price": "Нова роздрібна ціна, €:", "name": "Нова назва:", "pg": "Вага упаковки, г:", "sku": "Артикул:",
+                "reg": "Ціна каси Octobox за кг, € (для розрахунку ваги з чеків):"}
 
 
 @router.callback_query(F.data.startswith("prod:"))
@@ -424,7 +426,7 @@ async def prod_edit(cb: CallbackQuery, state: FSMContext, db, user):
     parts = cb.data.split(":")
     if not has_role(user, "manager"):
         return await cb.answer("Недостатньо прав", show_alert=True)
-    if len(parts) < 3 or parts[1] not in ("price", "name", "pg", "sku", "toggle"):
+    if len(parts) < 3 or parts[1] not in ("price", "name", "pg", "sku", "toggle", "reg"):
         return await cb.answer()
     pid = int(parts[2])
     if parts[1] == "toggle":
@@ -454,6 +456,8 @@ async def prod_edit_value(msg: Message, state: FSMContext, db, user):
             S.update_product(db, pid, piece_grams=int(msg.text), sale_mode="piece")
         elif f == "sku":
             S.update_product(db, pid, sku=msg.text.strip()[:40] or None)
+        elif f == "reg":
+            S.update_product(db, pid, register_price=parse_money(msg.text))
     except ParseError as e:
         return await msg.answer(f"⚠️ {e}")
     except Exception as e:

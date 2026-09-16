@@ -915,11 +915,15 @@ async def octo_run(cb: CallbackQuery, state: FSMContext, db, user):
     await cb.message.answer("⏳ Імпортую чеки…")
     receipts = parse_octobox_lines(data["octo_name"], base64.b64decode(data["octo_b64"]))
     try:
+        from ..tools import learn_register_prices
+        learned = learn_register_prices(receipts, user["telegram_id"])
         st = import_octobox(receipts, user["telegram_id"], since=since)
     except Exception as e:
         return await cb.message.answer(f"⚠️ Помилка імпорту: {e}")
     await state.clear()
     txt = [f"✅ Створено продажів: {st['created']}", f"Пропущено як уже імпортовані: {st['skipped_dup']}"]
+    if learned:
+        txt.append(f"💶 Ціни каси за кг оновлено для {len(learned)} товарів (використовуються для ваги при синхронізації)")
     if st.get("completed"):
         txt.append(f"Доповнено раніше імпортованих чеків: {st['completed']} (+{st['completed_lines']} поз.)")
     if st.get("complete_conflicts"):

@@ -120,7 +120,7 @@ def create_product(db: Database, name: str, category: str, sale_mode: str, retai
 
 
 def update_product(db: Database, product_id: int, **fields) -> None:
-    allowed = {"name", "category", "sku", "sale_mode", "piece_grams", "retail_price", "active"}
+    allowed = {"name", "category", "sku", "sale_mode", "piece_grams", "retail_price", "active", "register_price"}
     sets, vals = [], []
     for k, v in fields.items():
         if k not in allowed:

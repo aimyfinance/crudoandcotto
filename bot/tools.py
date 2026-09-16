@@ -339,9 +339,39 @@ def parse_octobox_lines(name: str, data: bytes) -> list[dict]:
         grams = int(round(float(w))) if w not in (None, "", 0) else 0
         rec = receipts.setdefault(num, {"number": num, "dt": d, "payment": payment, "refund": False, "lines": []})
         rec["refund"] = rec["refund"] or refund or amount < 0
+        c_disc = cols.get("rabatt")
+        disc = Decimal(str(r[c_disc]).replace("%", "").strip() or 0) if c_disc is not None and r[c_disc] not in (None, "") else Decimal(0)
         rec["lines"].append({"name": str(r[c_prod]).strip(), "group": r[c_grp] if c_grp is not None else None,
-                             "grams": grams, "amount": amount})
+                             "grams": grams, "amount": amount, "discount": disc})
     return sorted(receipts.values(), key=lambda x: (x["dt"], int(x["number"]) if x["number"].isdigit() else 0))
+
+
+def learn_register_prices(receipts: list[dict], user_id: int) -> dict[str, Decimal]:
+    """З рядків, де є вага, обчислює ціну каси за кг (медіана) і зберігає в картці товару. -> {назва бота: ціна}"""
+    import statistics
+    db = get_db()
+    per: dict[int, list[Decimal]] = {}
+    for rc in receipts:
+        for l in rc["lines"]:
+            if l["grams"] and l["amount"] > 0:
+                pid = S.match_product(db, l["name"])[0]
+                if not pid:
+                    continue
+                gross = l["amount"] / (1 - (l.get("discount") or Decimal(0)) / 100)
+                per.setdefault(pid, []).append(gross * 1000 / Decimal(l["grams"]))
+    learned = {}
+    for pid, vals in per.items():
+        prod = S.get_product(db, pid)
+        if prod["sale_mode"] != "weight":
+            continue
+        price = Decimal(str(statistics.median(vals))).quantize(Decimal("0.01"))
+        # округлюємо до «касового» вигляду: 37.99 → 38.00, 47.02 → 47.00
+        rounded = price.quantize(Decimal("1")) if abs(price - price.quantize(Decimal("1"))) <= Decimal("0.06") else price
+        S.update_product(db, pid, register_price=rounded)
+        if Decimal(prod["retail_price"]) == 0 or abs(Decimal(prod["retail_price"]) - rounded) / rounded > Decimal("0.02"):
+            S.update_product(db, pid, retail_price=rounded)
+        learned[prod["name"]] = rounded
+    return learned
 
 
 def octobox_summary(receipts: list[dict]) -> dict:
@@ -430,10 +460,20 @@ def _resolve_line(db, l: dict, cache: dict, st: dict, day: str, number: str, pla
         return None
     prod = S.get_product(db, pid)
     grams, pieces = l["grams"], None
+    if prod["sale_mode"] == "weight" and grams <= 0:
+        per_kg = Decimal(prod["register_price"] or 0) or Decimal(prod["retail_price"] or 0)
+        if per_kg > 0 and l["amount"] > 0:
+            gross = l["amount"] / (1 - (l.get("discount") or Decimal(0)) / 100)
+            grams = int((gross * 1000 / per_kg).quantize(Decimal("1")))
+            l["grams"] = grams
+    if prod["sale_mode"] == "weight" and grams <= 0 and l["amount"] <= 0:
+        st.setdefault("free_skipped", 0)
+        st["free_skipped"] += 1          # позиція за 0 € без ваги (подарунок/100 % знижка) — не впливає на виручку
+        return None
     if prod["sale_mode"] == "piece" or grams <= 0:
         pg = prod["piece_grams"] or 0
         if pg <= 0:
-            st["unmatched"][l["name"] + " (немає ваги і не штучний)"] = 1
+            st["unmatched"][l["name"] + " (немає ваги: задайте ціну каси за кг у картці товару)"] = 1
             return None
         pieces, grams = 1, pg
     price = (l["amount"] / pieces) if pieces else (l["amount"] * 1000 / Decimal(grams)).quantize(Decimal("0.0001"))
