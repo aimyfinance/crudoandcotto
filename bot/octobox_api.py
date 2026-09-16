@@ -127,29 +127,55 @@ async def diagnose(client: OdooClient) -> dict:
         weight = [k for k in fields if any(h in k.lower() or h in str(fields[k].get("string", "")).lower() for h in WEIGHT_HINTS)]
         out["weight_candidates"] = weight
         out["steps"].append("⚖️ кандидати поля ваги в рядку чека: " + (", ".join(f"{k} («{fields[k].get('string')}»)" for k in weight) or "не знайдено — вага може бути в qty"))
+    SIMPLE = ("float", "integer", "monetary", "char", "text", "boolean", "date", "datetime", "selection")
     if out.get("pos.order.line"):
-        # повний перелік полів рядка (для пошуку ваги) і повний останній рядок
-        all_fields = await client.fields_get("pos.order.line")
-        out["line_field_list"] = sorted((k, str(v.get("string", ""))) for k, v in all_fields.items())
-        out["steps"].append("🧩 усі поля рядка чека: " + ", ".join(f"{k} «{lbl}»" for k, lbl in out["line_field_list"] if not k.startswith("__")))
-        last = await client.search_read("pos.order.line", [], list(all_fields.keys()), limit=1, order="id desc")
-        if last:
-            rec = {k: v for k, v in last[0].items() if v not in (None, False, 0, 0.0, "", [])}
-            out["last_line_full"] = rec
-            out["steps"].append("🔎 останній рядок повністю: " + "; ".join(f"{k}={v}" for k, v in rec.items()))
+        try:
+            all_fields = await client.fields_get("pos.order.line")
+            simple = [k for k, v in all_fields.items() if v.get("type") in SIMPLE and not k.startswith("__")]
+            out["line_field_list"] = sorted((k, str(v.get("string", "")), v.get("type")) for k, v in all_fields.items())
+            out["steps"].append("🧩 прості поля рядка чека: " + ", ".join(f"{k} «{all_fields[k].get('string')}»" for k in sorted(simple)))
+            rel = [k for k, v in all_fields.items() if v.get("type") not in SIMPLE]
+            out["steps"].append("🔗 зв'язані поля рядка: " + ", ".join(sorted(rel)))
+        except OdooError as e:
+            out["steps"].append(f"⚠️ fields_get(pos.order.line): {e}")
+            simple = []
+        # читаємо останній рядок по частинах — поле, що дає помилку прав, просто пропускаємо
+        rec = {}
+        for chunk_start in range(0, len(simple), 10):
+            chunk = simple[chunk_start:chunk_start + 10]
+            try:
+                last = await client.search_read("pos.order.line", [], chunk, limit=1, order="id desc")
+                if last:
+                    rec.update({k: v for k, v in last[0].items() if v not in (None, False, 0, 0.0, "", [])})
+            except OdooError:
+                for f in chunk:
+                    try:
+                        last = await client.search_read("pos.order.line", [], [f], limit=1, order="id desc")
+                        if last and last[0].get(f) not in (None, False, 0, 0.0, "", []):
+                            rec[f] = last[0][f]
+                    except OdooError:
+                        rec[f] = "⛔ немає прав"
+        out["last_line_full"] = rec
+        out["steps"].append("🔎 останній рядок (прості поля): " + "; ".join(f"{k}={v}" for k, v in rec.items()))
     if out.get("pos.order"):
-        ofields_all = await client.fields_get("pos.order")
-        out["order_field_list"] = sorted(ofields_all.keys())
-        pay_like = [k for k in ofields_all if any(h in k for h in ("statement", "payment", "journal"))]
-        out["steps"].append("💳 поля оплати в чеку: " + (", ".join(pay_like) or "—"))
+        try:
+            ofields_all = await client.fields_get("pos.order")
+            pay_like = [k for k in ofields_all if any(h in k for h in ("statement", "payment", "journal"))]
+            out["steps"].append("💳 поля оплати в чеку: " + (", ".join(pay_like) or "—"))
+        except OdooError as e:
+            out["steps"].append(f"⚠️ fields_get(pos.order): {e}")
         for m in ("account.bank.statement.line", "pos.payment.method", "account.journal"):
             out[m] = await client.model_exists(m)
             out["steps"].append(f"{'✅' if out[m] else '❌'} модель {m}")
     if out.get("pos.config"):
-        cfgs = await client.search_read("pos.config", [], ["name"], limit=20)
-        out["configs"] = [c["name"] for c in cfgs]
-        out["steps"].append("🧾 каси: " + ", ".join(out["configs"]))
+        try:
+            cfgs = await client.search_read("pos.config", [], ["name"], limit=20)
+            out["configs"] = [c["name"] for c in cfgs]
+            out["steps"].append("🧾 каси: " + ", ".join(out["configs"]))
+        except OdooError as e:
+            out["steps"].append(f"⚠️ pos.config: {e}")
     if out.get("pos.order"):
+      try:
         fields = await client.fields_get("pos.order")
         want = [f for f in ORDER_FIELDS_BASE if f in fields]
         orders = await client.search_read("pos.order", [], want, limit=3, order="date_order desc")
@@ -167,6 +193,11 @@ async def diagnose(client: OdooClient) -> dict:
             pays = await client.search_read("pos.payment", [["id", "in", orders[0]["payment_ids"]]], ["amount", "payment_method_id"], limit=10)
             out["sample_payments"] = pays
             out["steps"].append("💳 оплати останнього чека: " + "; ".join(f"{(p.get('payment_method_id') or ['', '?'])[1]} {p.get('amount')}" for p in pays))
+        if orders and out.get("account.bank.statement.line") and orders[0].get("statement_ids"):
+            sts = await client.search_read("account.bank.statement.line", [["id", "in", orders[0]["statement_ids"]]], ["amount", "journal_id"], limit=10)
+            out["steps"].append("💳 оплати (виписка) останнього чека: " + "; ".join(f"{(p.get('journal_id') or ['', '?'])[1]} {p.get('amount')}" for p in sts))
+      except OdooError as e:
+        out["steps"].append(f"⚠️ читання чеків: {e}")
     return out
 
 
