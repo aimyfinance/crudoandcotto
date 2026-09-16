@@ -422,6 +422,35 @@ def create_sale(db: Database, user_id: int, lines: list[SaleLine], payment_metho
     return SaleResult(sid, total, cost_total, out_lines)
 
 
+def add_sale_lines(db: Database, sale_id: int, user_id: int, lines: list[SaleLine]) -> Decimal:
+    """Додає позиції до вже проведеного продажу (для доповнення імпорту). Повертає суму доданого."""
+    ts = now_utc()
+    added = ZERO
+    with db.tx() as c:
+        s = c.execute("SELECT * FROM sales WHERE id=?", (sale_id,)).fetchone()
+        if not s or s["status"] != "done":
+            raise ValueError("Продаж не знайдено або скасовано")
+        total, cost_total = d(s["total"]), d(s["cost_total"])
+        for ln in lines:
+            prod = c.execute("SELECT * FROM products WHERE id=?", (ln.product_id,)).fetchone()
+            taken = _consume_fifo(c, ln.product_id, ln.grams, prod["name"])
+            cost = sum((t[2] for t in taken), ZERO)
+            amt = ln.amount()
+            lid = c.execute(
+                "INSERT INTO sale_lines(sale_id, product_id, grams, pieces, price, amount, cost) VALUES (?,?,?,?,?,?,?)",
+                (sale_id, ln.product_id, ln.grams, ln.pieces, str(ln.price), str(amt), str(cost)),
+            ).lastrowid
+            for bid, g, cst in taken:
+                c.execute("INSERT INTO sale_line_batches(sale_line_id, batch_id, grams, cost) VALUES (?,?,?,?)", (lid, bid, g, str(cst)))
+                _movement(c, s["sold_at"], ln.product_id, bid, -g, -cst, "sale", "sale", sale_id, user_id)
+            total += amt
+            cost_total += cost
+            added += amt
+        c.execute("UPDATE sales SET total=?, cost_total=? WHERE id=?", (str(total), str(cost_total), sale_id))
+        audit(c, user_id, "sale.add_lines", {"sale_id": sale_id, "added": str(added)})
+    return added
+
+
 def cancel_sale(db: Database, sale_id: int, user_id: int, reason: str) -> None:
     ts = now_utc()
     with db.tx() as c:
@@ -585,6 +614,9 @@ def match_product(db: Database, raw: str) -> tuple[int | None, str]:
             if any(_difflib.SequenceMatcher(None, t, q).ratio() >= 0.8 for q in pt):
                 hit += 1
         score = hit / len(rt)
+        # перше слово назви (Culatta, Mortadella, Taleggio…) — головна ознака товару
+        if _difflib.SequenceMatcher(None, rt[0], pt[0]).ratio() >= 0.8:
+            score += 0.25
         if score >= 0.5:
             best.append((score, 1 if p["st"] > 0 else 0, -len(p["name"]), p["name"], p["id"]))
     if not best:

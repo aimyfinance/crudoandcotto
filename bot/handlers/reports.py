@@ -676,6 +676,10 @@ async def octo_run(cb: CallbackQuery, state: FSMContext, db, user):
         return await cb.message.answer(f"⚠️ Помилка імпорту: {e}")
     await state.clear()
     txt = [f"✅ Створено продажів: {st['created']}", f"Пропущено як уже імпортовані: {st['skipped_dup']}"]
+    if st.get("completed"):
+        txt.append(f"Доповнено раніше імпортованих чеків: {st['completed']} (+{st['completed_lines']} поз.)")
+    if st.get("complete_conflicts"):
+        txt.append("⚠️ Чеки з розбіжністю сум (не доповнено): " + "; ".join(st["complete_conflicts"][:8]))
     if st["skipped_old"]:
         txt.append(f"Пропущено як старіші за дату початку: {st['skipped_old']}")
     if st["refunds"]:

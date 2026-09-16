@@ -373,7 +373,7 @@ def import_octobox(receipts: list[dict], user_id: int, since: str | None = None,
     from .money import round_cents
     db = get_db()
     st = {"created": 0, "skipped_dup": 0, "skipped_old": 0, "refunds": 0, "refunds_unmatched": [],
-          "unmatched": {}, "shortfalls": []}
+          "unmatched": {}, "shortfalls": [], "completed": 0, "completed_lines": 0}
     cache: dict[str, int | None] = {}
     for rc in receipts:
         day = rc["dt"].date().isoformat()
@@ -381,8 +381,11 @@ def import_octobox(receipts: list[dict], user_id: int, since: str | None = None,
             st["skipped_old"] += 1
             continue
         key = f"octobox:{rc['number']}"
-        if db.one("SELECT 1 FROM sales WHERE client_key=?", (key,)):
+        existing = db.one("SELECT * FROM sales WHERE client_key=?", (key,))
+        if existing:
             st["skipped_dup"] += 1
+            if existing["status"] == "done" and not rc["refund"]:
+                _complete_receipt(db, existing, rc, user_id, cache, st)
             continue
         total = sum((l["amount"] for l in rc["lines"]), Decimal(0))
         if rc["refund"]:
@@ -402,30 +405,11 @@ def import_octobox(receipts: list[dict], user_id: int, since: str | None = None,
             continue
         lines = []
         planned: dict[int, int] = {}   # грамів уже заплановано в цьому чеку по товару
+        user_id_global[0] = user_id
         for l in rc["lines"]:
-            if l["name"] not in cache:
-                cache[l["name"]] = S.match_product(db, l["name"])[0]
-            pid = cache[l["name"]]
-            if not pid:
-                st["unmatched"][l["name"]] = st["unmatched"].get(l["name"], 0) + 1
-                continue
-            prod = S.get_product(db, pid)
-            grams, pieces = l["grams"], None
-            if prod["sale_mode"] == "piece" or grams <= 0:
-                pg = prod["piece_grams"] or 0
-                if pg <= 0:
-                    st["unmatched"][l["name"] + " (немає ваги і не штучний)"] = 1
-                    continue
-                pieces = 1
-                grams = pg
-            price = (l["amount"] / pieces) if pieces else (l["amount"] * 1000 / Decimal(grams)).quantize(Decimal("0.0001"))
-            need = planned.get(pid, 0) + grams
-            have = S.stock_of_product(db, pid)
-            if have < need:
-                _add_batch(db, user_id, pid, need - have, _last_price(db, pid), day, f"продано за касою, залишку в боті не було (чек {rc['number']})")
-                st["shortfalls"].append(f"{prod['name']} +{need - have} г")
-            planned[pid] = need
-            lines.append(S.SaleLine(pid, grams, price, pieces))
+            ln = _resolve_line(db, l, cache, st, day, rc["number"], planned)
+            if ln:
+                lines.append(ln)
         if not lines:
             if skip_unmatched:
                 continue
@@ -434,6 +418,68 @@ def import_octobox(receipts: list[dict], user_id: int, since: str | None = None,
                       sold_at=rc["dt"].replace(tzinfo=TZ).isoformat())
         st["created"] += 1
     return st
+
+
+def _resolve_line(db, l: dict, cache: dict, st: dict, day: str, number: str, planned: dict):
+    """Рядок чека → SaleLine (або None, якщо товар не прив'язано). Дооприбутковує нестачу."""
+    if l["name"] not in cache:
+        cache[l["name"]] = S.match_product(db, l["name"])[0]
+    pid = cache[l["name"]]
+    if not pid:
+        st["unmatched"][l["name"]] = st["unmatched"].get(l["name"], 0) + 1
+        return None
+    prod = S.get_product(db, pid)
+    grams, pieces = l["grams"], None
+    if prod["sale_mode"] == "piece" or grams <= 0:
+        pg = prod["piece_grams"] or 0
+        if pg <= 0:
+            st["unmatched"][l["name"] + " (немає ваги і не штучний)"] = 1
+            return None
+        pieces, grams = 1, pg
+    price = (l["amount"] / pieces) if pieces else (l["amount"] * 1000 / Decimal(grams)).quantize(Decimal("0.0001"))
+    need = planned.get(pid, 0) + grams
+    have = S.stock_of_product(db, pid)
+    if have < need:
+        _add_batch(db, user_id_global[0], pid, need - have, _last_price(db, pid), day, f"продано за касою, залишку в боті не було (чек {number})")
+        st["shortfalls"].append(f"{prod['name']} +{need - have} г")
+    planned[pid] = need
+    return S.SaleLine(pid, grams, price, pieces)
+
+
+user_id_global = [0]
+
+
+def _complete_receipt(db, sale, rc: dict, user_id: int, cache: dict, st: dict) -> None:
+    """Якщо в уже імпортованому чеку бракує позицій (тоді не було прив'язки) — додає їх."""
+    from .money import round_cents
+    user_id_global[0] = user_id
+    existing = [(r["product_id"], Decimal(r["amount"])) for r in db.q("SELECT product_id, amount FROM sale_lines WHERE sale_id=?", (sale["id"],))]
+    missing = []
+    planned: dict[int, int] = {}
+    day = rc["dt"].date().isoformat()
+    for l in rc["lines"]:
+        if l["name"] not in cache:
+            cache[l["name"]] = S.match_product(db, l["name"])[0]
+        pid = cache[l["name"]]
+        if not pid:
+            continue
+        pair = (pid, round_cents(l["amount"]))
+        if pair in existing:
+            existing.remove(pair)
+            continue
+        ln = _resolve_line(db, l, cache, st, day, rc["number"], planned)
+        if ln:
+            missing.append(ln)
+    if not missing:
+        return
+    gap = round_cents(sum((l["amount"] for l in rc["lines"]), Decimal(0)) - Decimal(sale["total"]))
+    add_sum = round_cents(sum((ln.amount() for ln in missing), Decimal(0)))
+    if gap <= 0 or abs(add_sum - gap) > Decimal("0.05"):
+        st.setdefault("complete_conflicts", []).append(f"чек {rc['number']}: у боті {sale['total']} €, у касі {gap + Decimal(sale['total'])} € — перевірте вручну")
+        return
+    S.add_sale_lines(db, sale["id"], user_id, missing)
+    st["completed"] += 1
+    st["completed_lines"] += len(missing)
 
 
 def now_iso() -> str:
