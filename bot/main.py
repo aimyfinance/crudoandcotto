@@ -13,7 +13,7 @@ from aiogram.types import BotCommand, FSInputFile, MenuButtonWebApp, WebAppInfo
 from . import services as S
 from .config import TZ, settings
 from .db import get_db
-from .handlers import adjustments, catalog, common, purchases, reports, sales, tasks
+from .handlers import adjustments, catalog, common, octobox, purchases, reports, sales, tasks
 
 log = logging.getLogger("crudo")
 
@@ -24,7 +24,7 @@ def build_dispatcher() -> Dispatcher:
     dp.message.outer_middleware(common.AuthMiddleware())
     dp.callback_query.outer_middleware(common.AuthMiddleware())
     # порядок важливий: спочатку сценарії зі станами, common (скасування) — першим
-    dp.include_routers(common.router, sales.router, purchases.router, catalog.router, adjustments.router, reports.router, tasks.router)
+    dp.include_routers(common.router, sales.router, purchases.router, catalog.router, adjustments.router, reports.router, tasks.router, octobox.router)
     return dp
 
 
@@ -90,6 +90,7 @@ async def main() -> None:
             log.warning("не вдалося встановити кнопку меню Mini App (%s): %s", settings.webapp_url, e)
     asyncio.create_task(daily_backup(bot))
     asyncio.create_task(minute_loop(bot))
+    asyncio.create_task(octobox.sync_loop(bot))
     log.info("bot started, db=%s", settings.db_path)
     await bot.delete_webhook(drop_pending_updates=False)
     await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
