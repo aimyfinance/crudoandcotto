@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove, WebAppInfo
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from . import services as S
+from .config import settings
 from .money import fmt_price
 
 BACK = "◀️ Назад"
@@ -29,9 +30,14 @@ ROLE_MENUS = {
 MENU_BUTTONS = {M_SALE, M_PURCHASE, M_STOCK, M_PRODUCTS, M_BATCHES, M_WRITEOFF, M_HISTORY, M_REPORTS, M_SETTINGS}
 
 
+M_APP = "🧾 Відкрити касу"
+
+
 def main_menu(role: str) -> ReplyKeyboardMarkup:
-    rows = ROLE_MENUS.get(role, ROLE_MENUS["seller"])
-    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=t) for t in r] for r in rows], resize_keyboard=True)
+    rows = [[KeyboardButton(text=t) for t in r] for r in ROLE_MENUS.get(role, ROLE_MENUS["seller"])]
+    if settings.webapp_url:
+        rows.insert(0, [KeyboardButton(text=M_APP, web_app=WebAppInfo(url=settings.webapp_url + "/app"))])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
 def nav_kb(*extra: str, back: bool = True) -> ReplyKeyboardMarkup:

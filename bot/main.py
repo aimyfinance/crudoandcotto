@@ -8,7 +8,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BotCommand, FSInputFile
+from aiogram.types import BotCommand, FSInputFile, MenuButtonWebApp, WebAppInfo
 
 from . import services as S
 from .config import TZ, settings
@@ -46,19 +46,17 @@ async def daily_backup(bot: Bot) -> None:
             log.exception("backup failed")
 
 
-async def health_server() -> None:
-    """Для хостингів, що вимагають відкритий порт (Render/Koyeb): відповідає 200 OK на /."""
+async def web_server() -> None:
+    """HTTP-сервер: /health для хостингу + Mini App (сторінка і API), якщо задано PORT."""
     if not settings.health_port:
         return
     from aiohttp import web
+    from .webapp import build_app
 
-    app = web.Application()
-    app.router.add_get("/", lambda r: web.Response(text="ok"))
-    app.router.add_get("/health", lambda r: web.Response(text="ok"))
-    runner = web.AppRunner(app)
+    runner = web.AppRunner(build_app())
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", settings.health_port).start()
-    log.info("health endpoint on :%s", settings.health_port)
+    log.info("web server on :%s (mini app %s)", settings.health_port, settings.webapp_url or "вимкнено — задайте WEBAPP_URL")
 
 
 async def main() -> None:
@@ -72,7 +70,9 @@ async def main() -> None:
                                BotCommand(command="id", description="Мій Telegram ID"),
                                BotCommand(command="help", description="Довідка"),
                                BotCommand(command="backup", description="Резервна копія (адмін)")])
-    await health_server()
+    await web_server()
+    if settings.webapp_url:
+        await bot.set_chat_menu_button(menu_button=MenuButtonWebApp(text="Каса", web_app=WebAppInfo(url=settings.webapp_url + "/app")))
     asyncio.create_task(daily_backup(bot))
     log.info("bot started, db=%s", settings.db_path)
     await bot.delete_webhook(drop_pending_updates=False)

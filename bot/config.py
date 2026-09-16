@@ -31,6 +31,7 @@ class Settings:
     backup_hour: int = int(os.getenv("BACKUP_HOUR", "23"))
     health_port: int | None = int(os.getenv("PORT")) if os.getenv("PORT") else None
     company_name: str = os.getenv("COMPANY_NAME", "Crudo & Cotto Delikatessen")
+    webapp_url: str = os.getenv("WEBAPP_URL", "").strip().rstrip("/")   # публічна https-адреса сервера для Mini App
 
     def validate(self) -> None:
         if not self.bot_token:

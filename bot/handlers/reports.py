@@ -15,11 +15,11 @@ from aiogram.types import BufferedInputFile, CallbackQuery, FSInputFile, Message
 from .. import services as S
 from ..cash_import import parse_cash_report
 from ..config import TZ, settings
-from ..db import today_local
 from ..export import build_csv_movements, build_excel
 from ..keyboards import CANCEL, M_REPORTS, M_SETTINGS, inline, main_menu, nav_kb
 from ..money import fmt_grams, fmt_money
-from .common import has_role, parse_period, ua_date
+from ..db import today_local, get_db
+from .common import Flow, has_role, parse_date, parse_period, ua_date
 
 router = Router(name="reports")
 
@@ -35,6 +35,17 @@ class Sett(StatesGroup):
     cash_confirm = State()
     products_file = State()
     opening_file = State()
+    history_file = State()
+    expenses_file = State()
+    reset_confirm = State()
+
+
+class Exp(StatesGroup):
+    date = State()
+    type = State()
+    category = State()
+    amount = State()
+    comment = State()
 
 
 # ---------------- періоди ----------------
@@ -71,12 +82,19 @@ def report_text(rep: dict) -> str:
            f"Списано: {fmt_grams(rep['writeoff_grams'])} на {fmt_money(rep['writeoff_cost'])}"]
     if rep["adjustment_grams"]:
         out.append(f"Інвентаризаційні коригування: {rep['adjustment_grams']:+d} г ({fmt_money(rep['adjustment_cost'])})")
+    out.append(f"Валовий прибуток після списань: {fmt_money(rep['gross_after_writeoffs'])}")
+    ex = rep["expenses"]["by_type"]
+    if any(ex.values()):
+        out.append(f"Операційні витрати: {fmt_money(ex['operating'])} · податки: {fmt_money(ex['tax'])}")
+        out.append(f"<b>Операційний результат</b> (ВП − списання − опер. витрати − податки): <b>{fmt_money(rep['operating_result'])}</b>")
+        if ex["goods"] or ex["investment"]:
+            out.append(f"<i>Довідково: оплата товару {fmt_money(ex['goods'])}, інвестиції {fmt_money(ex['investment'])}</i>")
     out.append(f"Поточні залишки: {fmt_grams(rep['stock_grams'])} на {fmt_money(rep['stock_value'])}")
     if rep["by_product"]:
         out.append("\n<b>Продажі за товарами</b> (виручка · вал. прибуток · маржа)")
         for e in rep["by_product"][:15]:
             out.append(f"• {e['name']}: {fmt_grams(e['grams'])} · {fmt_money(e['amount'])} · {fmt_money(e['gross_profit'])} · {e['margin_pct']:.0f} %")
-    out.append("\n<i>Валовий прибуток = виручка − собівартість проданого (з транспортом). Операційні витрати не враховано.</i>")
+    out.append("\n<i>Валовий прибуток = виручка − собівартість проданого (з транспортом). Це не чистий прибуток.</i>")
     return "\n".join(out)
 
 
@@ -88,7 +106,7 @@ def period_kb():
 
 def export_kb(d1: str, d2: str):
     return inline([[("📊 Excel (структура звіту)", f"rep:xlsx:{d1}:{d2}"), ("📄 CSV операцій", f"rep:csv:{d1}:{d2}")],
-                   [("🧾 Звірка з касою", f"rep:rec:{d1}:{d2}")]])
+                   [("🧾 Звірка з касою", f"rep:rec:{d1}:{d2}"), ("💸 Витрати за період", f"rep:exp:{d1}:{d2}")]])
 
 
 @router.message(F.text == M_REPORTS)
@@ -98,6 +116,7 @@ async def reports(msg: Message, state: FSMContext, user):
     await state.clear()
     await msg.answer("📈 <b>Звіти</b> — оберіть період:", reply_markup=main_menu(user["role"]))
     await msg.answer("Період:", reply_markup=period_kb())
+    await msg.answer("Витрати:", reply_markup=inline([[("➕ Додати витрату", "exp:add"), ("🗑 Останні витрати", "exp:list")]]))
 
 
 @router.callback_query(F.data == "rep:custom")
@@ -137,6 +156,21 @@ async def rep_cb(cb: CallbackQuery, db, user):
     elif code == "csv":
         await cb.answer()
         await cb.message.answer_document(BufferedInputFile(build_csv_movements(db, d1, d2), filename=f"operations_{d1}_{d2}.csv"))
+    elif code == "exp":
+        ex = S.expenses_period(db, d1, d2)
+        if not ex["rows"]:
+            await cb.message.answer("Витрат за період немає.")
+        else:
+            txt = [f"💸 <b>Витрати {ua_date(d1)} — {ua_date(d2)}</b>"]
+            for t, label in S.EXP_TYPES.items():
+                cats = [(c, v) for (tt, c), v in ex["by_category"].items() if tt == t]
+                if not cats:
+                    continue
+                txt.append(f"\n<b>{label}: {fmt_money(ex['by_type'][t])}</b>")
+                for c, v in sorted(cats, key=lambda x: -x[1]):
+                    txt.append(f"• {c}: {fmt_money(v)}")
+            await cb.message.answer("\n".join(txt))
+        await cb.answer()
     elif code == "rec":
         rows = S.reconcile(db, d1, d2)
         if not rows:
@@ -153,6 +187,144 @@ async def rep_cb(cb: CallbackQuery, db, user):
         await cb.answer()
 
 
+# ---------------- витрати: ручне введення ----------------
+
+async def e_date(msg, state):
+    await msg.answer("💸 Дата витрати:", reply_markup=nav_kb("📅 Сьогодні", back=False))
+
+
+async def e_type(msg, state):
+    await msg.answer("Тип:", reply_markup=nav_kb())
+    await msg.answer("Оберіть:", reply_markup=inline([[(v, f"exp:type:{k}")] for k, v in S.EXP_TYPES.items()]))
+
+
+async def e_category(msg, state):
+    data = await state.get_data()
+    cats = S.expense_categories(get_db(), data["exp_type"])[:12]
+    await msg.answer("Категорія — введіть назву або оберіть:", reply_markup=nav_kb())
+    if cats:
+        await msg.answer("Останні:", reply_markup=inline([[(c[:40], f"exp:cat:{i}")] for i, c in enumerate(cats)]))
+    await state.update_data(cat_options=cats)
+
+
+async def e_amount(msg, state):
+    await msg.answer("Сума, €:", reply_markup=nav_kb())
+
+
+async def e_comment(msg, state):
+    await msg.answer("Коментар (або пропустіть):", reply_markup=nav_kb("⏭ Пропустити"))
+
+
+eflow = Flow({Exp.date: e_date, Exp.type: e_type, Exp.category: e_category, Exp.amount: e_amount, Exp.comment: e_comment})
+
+
+@router.callback_query(F.data == "exp:add")
+async def exp_add(cb: CallbackQuery, state: FSMContext, user):
+    if not has_role(user, "manager"):
+        return await cb.answer("Недостатньо прав", show_alert=True)
+    await state.clear()
+    await cb.answer()
+    await eflow.goto(cb.message, state, Exp.date, push=False)
+
+
+@router.message(StateFilter(Exp), F.text == "◀️ Назад")
+async def exp_back(msg: Message, state: FSMContext, user):
+    await eflow.back(msg, state, user)
+
+
+@router.message(StateFilter(Exp.date), F.text)
+async def exp_date(msg: Message, state: FSMContext):
+    d_ = today_local() if msg.text.startswith("📅") else parse_date(msg.text)
+    if not d_:
+        return await msg.answer("⚠️ Дата як 15.09.2026")
+    await state.update_data(op_date=d_)
+    await eflow.goto(msg, state, Exp.type)
+
+
+@router.callback_query(StateFilter(Exp.type), F.data.startswith("exp:type:"))
+async def exp_type(cb: CallbackQuery, state: FSMContext):
+    await state.update_data(exp_type=cb.data.split(":")[2])
+    await cb.answer()
+    await eflow.goto(cb.message, state, Exp.category)
+
+
+@router.callback_query(StateFilter(Exp.category), F.data.startswith("exp:cat:"))
+async def exp_cat_pick(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    await state.update_data(category=data["cat_options"][int(cb.data.split(":")[2])])
+    await cb.answer()
+    await eflow.goto(cb.message, state, Exp.amount)
+
+
+@router.message(StateFilter(Exp.category), F.text)
+async def exp_cat_text(msg: Message, state: FSMContext):
+    await state.update_data(category=msg.text.strip()[:60])
+    await eflow.goto(msg, state, Exp.amount)
+
+
+@router.message(StateFilter(Exp.amount), F.text)
+async def exp_amount(msg: Message, state: FSMContext):
+    from ..money import parse_money, ParseError
+    try:
+        v = parse_money(msg.text)
+    except ParseError as e:
+        return await msg.answer(f"⚠️ {e}")
+    await state.update_data(amount=str(v))
+    await eflow.goto(msg, state, Exp.comment)
+
+
+@router.message(StateFilter(Exp.comment), F.text)
+async def exp_comment(msg: Message, state: FSMContext, db, user):
+    data = await state.get_data()
+    comment = None if msg.text.startswith("⏭") else msg.text.strip()[:120]
+    eid = S.add_expense(db, user["telegram_id"], data["op_date"], data["exp_type"], data["category"], Decimal(data["amount"]), comment)
+    await state.clear()
+    await msg.answer(f"✅ Витрату №{eid} записано: {S.EXP_TYPES[data['exp_type']]} · {data['category']} · {fmt_money(data['amount'])} · {ua_date(data['op_date'])}",
+                     reply_markup=main_menu(user["role"]))
+
+
+@router.callback_query(F.data == "exp:list")
+async def exp_list(cb: CallbackQuery, db, user):
+    rows = S.recent_expenses(db, 10)
+    if not rows:
+        await cb.message.answer("Витрат ще немає.")
+    else:
+        await cb.message.answer("Останні витрати (натисніть, щоб видалити помилкову):", reply_markup=inline(
+            [[(f"{ua_date(r['op_date'])} {r['category'][:22]} {fmt_money(r['amount'])}", f"exp:del:{r['id']}")] for r in rows]))
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("exp:del:"))
+async def exp_del(cb: CallbackQuery, db, user):
+    if not has_role(user, "manager"):
+        return await cb.answer("Недостатньо прав", show_alert=True)
+    S.cancel_expense(db, int(cb.data.split(":")[2]), user["telegram_id"])
+    await cb.answer("Витрату скасовано", show_alert=True)
+
+
+# ---------------- очищення бази ----------------
+
+@router.message(Command("reset_db"))
+async def reset_db_start(msg: Message, state: FSMContext, user):
+    if user["role"] != "admin":
+        return
+    await state.set_state(Sett.reset_confirm)
+    await msg.answer("⚠️ Це видалить УСІ товари, партії, продажі, закупівлі, списання й витрати (користувачі лишаться). "
+                     "Перед видаленням буде зроблено резервну копію.\nЩоб підтвердити, надішліть слово <b>ВИДАЛИТИ</b>.",
+                     reply_markup=nav_kb(back=False))
+
+
+@router.message(StateFilter(Sett.reset_confirm), F.text)
+async def reset_db_confirm(msg: Message, state: FSMContext, db, user):
+    await state.clear()
+    if msg.text.strip() != "ВИДАЛИТИ":
+        return await msg.answer("Скасовано, нічого не видалено.", reply_markup=main_menu(user["role"]))
+    path = db.make_backup()
+    await msg.answer_document(FSInputFile(path), caption="💾 Копія бази перед очищенням — збережіть.")
+    S.reset_all_data(db, user["telegram_id"])
+    await msg.answer("🧹 Базу очищено. Тепер можна імпортувати історію.", reply_markup=main_menu(user["role"]))
+
+
 # ---------------- налаштування ----------------
 
 def settings_kb(user):
@@ -161,7 +333,8 @@ def settings_kb(user):
         rows += [[("➕ Додати користувача", "set:adduser")],
                  [("💾 Резервна копія зараз", "set:backup"), ("♻️ Відновити з файлу", "set:restore")],
                  [("🧾 Імпорт звіту каси", "set:cashimport")],
-                 [("📥 Імпорт товарів з файлу", "set:prodimport"), ("📥 Імпорт початкових залишків", "set:openimport")]]
+                 [("📥 Імпорт товарів з файлу", "set:prodimport"), ("📥 Імпорт початкових залишків", "set:openimport")],
+                 [("📥 Імпорт історії руху товарів", "set:histimport"), ("📥 Імпорт витрат", "set:expimport")]]
     return inline(rows)
 
 
@@ -315,6 +488,65 @@ async def open_import_file(msg: Message, state: FSMContext, user):
         return await msg.answer(f"⚠️ Не вдалося прочитати файл: {e}")
     await state.clear()
     txt = f"✅ Створено партій початкового залишку: {created}"
+    if errors:
+        txt += "\n\n⚠️ Помилки:\n" + "\n".join(errors[:15])
+    await msg.answer(txt, reply_markup=main_menu(user["role"]))
+
+
+@router.callback_query(F.data == "set:histimport")
+async def hist_import_start(cb: CallbackQuery, state: FSMContext, user):
+    if user["role"] != "admin":
+        return await cb.answer("Лише адміністратор", show_alert=True)
+    await state.set_state(Sett.history_file)
+    await cb.message.answer(
+        "📥 Надішліть файл історії (Excel з аркушем «Рух товарів»). По кожному періоду і товару бот створить закупівлю, "
+        "продаж (спосіб оплати «Інше»), списання і вирівняє залишок до колонки closing_kg. Товари, яких немає, буде створено.\n"
+        "Повторне надсилання того ж файлу нічого не дублює. Це може тривати до хвилини.",
+        reply_markup=nav_kb(back=False))
+    await cb.answer()
+
+
+@router.message(StateFilter(Sett.history_file), F.document)
+async def hist_import_file(msg: Message, state: FSMContext, user):
+    from ..tools import import_history
+    doc = msg.document
+    buf = io.BytesIO()
+    await msg.bot.download(doc, destination=buf)
+    await msg.answer("⏳ Імпортую…")
+    try:
+        st = import_history(doc.file_name, buf.getvalue(), user["telegram_id"])
+    except Exception as e:
+        return await msg.answer(f"⚠️ Не вдалося прочитати файл: {e}")
+    await state.clear()
+    txt = (f"✅ Історію імпортовано.\nРядків (період × товар): {st['rows']}, пропущено як уже імпортовані: {st['skipped']}\n"
+           f"Створено нових товарів: {st['products_created']}\nВирівнювань до звіту: {st['aligned']}")
+    if st["errors"]:
+        txt += "\n\n⚠️ Помилки:\n" + "\n".join(st["errors"][:15])
+    await msg.answer(txt, reply_markup=main_menu(user["role"]))
+
+
+@router.callback_query(F.data == "set:expimport")
+async def exp_import_start(cb: CallbackQuery, state: FSMContext, user):
+    if user["role"] != "admin":
+        return await cb.answer("Лише адміністратор", show_alert=True)
+    await state.set_state(Sett.expenses_file)
+    await cb.message.answer("📥 Надішліть файл витрат (Excel з аркушем «Витрати» або CSV): <code>date; type; category; amount; comment</code>. "
+                            "Дублікати (та сама дата, тип, категорія, сума) пропускаються.", reply_markup=nav_kb(back=False))
+    await cb.answer()
+
+
+@router.message(StateFilter(Sett.expenses_file), F.document)
+async def exp_import_file(msg: Message, state: FSMContext, user):
+    from ..tools import import_expenses
+    doc = msg.document
+    buf = io.BytesIO()
+    await msg.bot.download(doc, destination=buf)
+    try:
+        created, skipped, errors = import_expenses(doc.file_name, buf.getvalue(), user["telegram_id"])
+    except Exception as e:
+        return await msg.answer(f"⚠️ Не вдалося прочитати файл: {e}")
+    await state.clear()
+    txt = f"✅ Витрат додано: {created}, пропущено (дублікати): {skipped}"
     if errors:
         txt += "\n\n⚠️ Помилки:\n" + "\n".join(errors[:15])
     await msg.answer(txt, reply_markup=main_menu(user["role"]))

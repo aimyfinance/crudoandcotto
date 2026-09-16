@@ -380,10 +380,11 @@ def _consume_fifo(c, product_id: int, grams: int, product_name: str) -> list[tup
 
 
 def create_sale(db: Database, user_id: int, lines: list[SaleLine], payment_method: str,
-                client_key: str | None = None, comment: str | None = None) -> SaleResult:
+                client_key: str | None = None, comment: str | None = None, sold_at: str | None = None) -> SaleResult:
+    """sold_at — лише для імпорту історії (ISO-дата 'YYYY-MM-DD'); інакше — зараз."""
     if not lines:
         raise ValueError("Продаж без позицій")
-    ts = now_utc()
+    ts = f"{sold_at}T12:00:00+00:00" if sold_at else now_utc()
     with db.tx() as c:
         if client_key:
             dup = c.execute("SELECT id, total, cost_total FROM sales WHERE client_key=?", (client_key,)).fetchone()
@@ -459,9 +460,9 @@ def recent_sales(db: Database, limit: int = 15, date: str | None = None):
 # ======================= списання / коригування =======================
 
 def write_off(db: Database, user_id: int, product_id: int, grams: int, reason: str,
-              batch_id: int | None = None) -> int:
-    """Списання з причиною. Якщо batch_id не вказано — FIFO."""
-    ts = now_utc()
+              batch_id: int | None = None, op_date: str | None = None) -> int:
+    """Списання з причиною. Якщо batch_id не вказано — FIFO. op_date — лише для імпорту історії."""
+    ts = f"{op_date}T12:00:00+00:00" if op_date else now_utc()
     with db.tx() as c:
         prod = c.execute("SELECT name FROM products WHERE id=?", (product_id,)).fetchone()
         if batch_id:
@@ -489,9 +490,10 @@ def write_off(db: Database, user_id: int, product_id: int, grams: int, reason: s
         return wid
 
 
-def inventory_adjust(db: Database, user_id: int, batch_id: int, actual_grams: int, reason: str) -> int:
+def inventory_adjust(db: Database, user_id: int, batch_id: int, actual_grams: int, reason: str,
+                     op_date: str | None = None) -> int:
     """Інвентаризаційне коригування конкретної партії до фактичного залишку."""
-    ts = now_utc()
+    ts = f"{op_date}T12:00:00+00:00" if op_date else now_utc()
     with db.tx() as c:
         b = c.execute("SELECT * FROM batches WHERE id=?", (batch_id,)).fetchone()
         if not b:
@@ -511,6 +513,69 @@ def inventory_adjust(db: Database, user_id: int, batch_id: int, actual_grams: in
         _movement(c, ts, b["product_id"], batch_id, delta, cost_delta, "adjustment", "writeoff", wid, user_id)
         audit(c, user_id, "adjustment.create", {"writeoff_id": wid, "delta": delta, "reason": reason})
         return wid
+
+
+def reset_all_data(db: Database, user_id: int) -> None:
+    """Повне очищення облікових даних (товари, партії, операції, витрати). Користувачі лишаються.
+    Перед цим робиться резервна копія."""
+    db.make_backup()
+    with db.tx() as c:
+        for t in ("sale_line_batches", "sale_lines", "sales", "writeoff_batches", "writeoffs", "stock_movements",
+                  "batches", "purchase_lines", "purchases", "suppliers", "products", "expenses", "cash_register_days",
+                  "processed_updates"):
+            c.execute(f"DELETE FROM {t}")
+        c.execute("DELETE FROM sqlite_sequence")
+        audit(c, user_id, "db.reset", None)
+
+
+# ======================= витрати =======================
+
+EXP_TYPES = {"operating": "Операційні", "goods": "Оплата товару", "tax": "Податки", "investment": "Інвестиції"}
+
+
+def add_expense(db: Database, user_id: int, op_date: str, exp_type: str, category: str, amount: Decimal,
+                comment: str | None = None) -> int:
+    if exp_type not in EXP_TYPES:
+        raise ValueError("Невідомий тип витрати")
+    with db.tx() as c:
+        eid = c.execute(
+            "INSERT INTO expenses(op_date, exp_type, category, amount, comment, status, created_by, created_at) "
+            "VALUES (?,?,?,?,?,'done',?,?)",
+            (op_date, exp_type, category.strip(), str(round_cents(amount)), comment, user_id, now_utc()),
+        ).lastrowid
+        audit(c, user_id, "expense.create", {"expense_id": eid, "amount": str(amount)})
+        return eid
+
+
+def cancel_expense(db: Database, expense_id: int, user_id: int) -> None:
+    with db.tx() as c:
+        c.execute("UPDATE expenses SET status='cancelled' WHERE id=?", (expense_id,))
+        audit(c, user_id, "expense.cancel", {"expense_id": expense_id})
+
+
+def expense_categories(db: Database, exp_type: str | None = None) -> list[str]:
+    sql = "SELECT category, COUNT(*) n FROM expenses WHERE status='done'"
+    p: list = []
+    if exp_type:
+        sql += " AND exp_type=?"
+        p.append(exp_type)
+    return [r["category"] for r in db.q(sql + " GROUP BY category ORDER BY n DESC, category", p)]
+
+
+def expenses_period(db: Database, date_from: str, date_to: str) -> dict:
+    rows = db.q("SELECT * FROM expenses WHERE status='done' AND op_date BETWEEN ? AND ? ORDER BY op_date, id",
+                (date_from, date_to))
+    by_type: dict[str, Decimal] = {k: ZERO for k in EXP_TYPES}
+    by_cat: dict[tuple, Decimal] = {}
+    for r in rows:
+        by_type[r["exp_type"]] += d(r["amount"])
+        key = (r["exp_type"], r["category"])
+        by_cat[key] = by_cat.get(key, ZERO) + d(r["amount"])
+    return {"rows": rows, "by_type": by_type, "by_category": by_cat}
+
+
+def recent_expenses(db: Database, limit: int = 15):
+    return db.q("SELECT * FROM expenses WHERE status='done' ORDER BY op_date DESC, id DESC LIMIT ?", (limit,))
 
 
 def cancel_writeoff(db: Database, writeoff_id: int, user_id: int, reason: str) -> None:
@@ -587,7 +652,12 @@ def report_period(db: Database, date_from: str, date_to: str) -> dict:
     adj_cost = sum((d(w["cost_delta"]) for w in wos if w["kind"] == "adjustment"), ZERO)
 
     stock = stock_summary(db)
+    exp = expenses_period(db, date_from, date_to)
+    gross = revenue - cogs
+    after_wo = gross - writeoff_cost
+    op_result = after_wo - exp["by_type"]["operating"] - exp["by_type"]["tax"]
     return {
+        "expenses": exp, "gross_after_writeoffs": after_wo, "operating_result": op_result,
         "date_from": date_from, "date_to": date_to,
         "sales_count": len(sales), "revenue": revenue, "cogs": cogs, "gross_profit": revenue - cogs,
         "by_payment": by_payment, "by_product": sorted(by_product.values(), key=lambda e: -e["amount"]),

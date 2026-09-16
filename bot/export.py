@@ -160,6 +160,24 @@ def build_excel(db: Database, date_from: str, date_to: str, out_path: Path) -> P
             r += 1
     _autosize(ws5)
 
+    # ---------- Аркуш «Витрати» ----------
+    ws7 = wb.create_sheet("Витрати")
+    _header(ws7, 1, ["Дата", "Тип", "Категорія", "Сума, €", "Коментар"])
+    r = 2
+    ex = S.expenses_period(db, date_from, date_to)
+    for e in ex["rows"]:
+        for i, v in enumerate([e["op_date"], S.EXP_TYPES[e["exp_type"]], e["category"], _f(d(e["amount"])), e["comment"]], 1):
+            ws7.cell(row=r, column=i, value=v)
+        r += 1
+    r += 1
+    for t, label in S.EXP_TYPES.items():
+        ws7.cell(row=r, column=2, value=f"Разом: {label}").font = BOLD
+        ws7.cell(row=r, column=4, value=_f(ex["by_type"][t])).font = BOLD
+        r += 1
+    ws7.cell(row=r, column=2, value="Операційний результат (ВП − списання − опер. витрати − податки)").font = BOLD
+    ws7.cell(row=r, column=4, value=_f(rep["operating_result"])).font = BOLD
+    _autosize(ws7)
+
     # ---------- Аркуш «Операції» — журнал усіх рухів ----------
     ws6 = wb.create_sheet("Операції")
     _header(ws6, 1, ["Дата/час (Відень)", "Тип", "Документ", "Товар", "Партія", "Δ вага, кг", "Δ собівартість, €", "Користувач"])

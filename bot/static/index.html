@@ -1,0 +1,359 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>Crudo &amp; Cotto — каса</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;0,600;1,500&family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root{
+  --board:#1F3B2C;      /* зелена крейдяна дошка */
+  --board-deep:#152A1F;
+  --charcoal:#2B2D2A;   /* корпус причепа */
+  --chalk:#F2EBDD;      /* крейда */
+  --paper:#F6F1E7;      /* папір для сирів */
+  --paper-2:#EDE6D8;
+  --oak:#B98A4E;        /* дуб */
+  --oak-deep:#8F6832;
+  --ink:#1E1F1C;
+  --ink-2:#5D5F58;
+  --line:rgba(30,31,28,.12);
+  --chalk-line:rgba(242,235,221,.35);
+  --red:#B8443A;
+  --ok:#3E7A4A;
+  --r-s:6px; --r-m:12px; --r-l:20px;
+  --serif:"Cormorant Garamond","Times New Roman",Georgia,serif;
+  --sans:"Manrope",-apple-system,"Segoe UI",Roboto,sans-serif;
+  --safe-b:env(safe-area-inset-bottom,0px);
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;height:100%;background:var(--paper);color:var(--ink);font-family:var(--sans);font-size:16px;line-height:1.35}
+button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:pointer}
+input{font:inherit}
+.hide{display:none!important}
+
+/* ---------- дошка ---------- */
+.board{background:var(--board);color:var(--chalk);padding:14px 18px 16px;position:relative;overflow:hidden}
+.board::after{content:"";position:absolute;inset:0;background:
+  radial-gradient(120% 80% at 20% 0%,rgba(255,255,255,.06),transparent 60%),
+  repeating-linear-gradient(0deg,transparent 0 3px,rgba(255,255,255,.012) 3px 4px);pointer-events:none}
+.brand{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;position:relative;z-index:1}
+.logo{display:inline-block;border:1.5px solid var(--chalk-line);border-radius:4px;padding:6px 12px 8px;text-align:center;flex:0 0 auto}
+.logo b{display:block;font:600 24px/1 var(--serif);letter-spacing:.01em;white-space:nowrap}
+.logo small{display:block;font:500 9px/1 var(--sans);letter-spacing:.28em;margin-top:6px;opacity:.8;text-transform:uppercase}
+.board .kpi{text-align:right}
+.board .kpi .n{font:600 34px/1 var(--serif);letter-spacing:-.01em}
+.board .kpi .l{font-size:12px;opacity:.75;margin-top:4px;white-space:nowrap}
+.board .who{font-size:12px;opacity:.7;margin-top:10px;position:relative;z-index:1}
+
+/* ---------- екрани ---------- */
+.screen{padding:12px 14px calc(150px + var(--safe-b))}
+.filters{display:flex;gap:8px;overflow-x:auto;padding:2px 0 10px;scrollbar-width:none}
+.filters::-webkit-scrollbar{display:none}
+.chip{flex:0 0 auto;padding:8px 14px;border-radius:999px;border:1px solid var(--line);background:#fff;font-weight:600;font-size:14px;color:var(--ink-2)}
+.chip.on{background:var(--charcoal);color:var(--chalk);border-color:var(--charcoal)}
+.search{width:100%;padding:11px 14px;border:1px solid var(--line);border-radius:var(--r-m);background:#fff;margin-bottom:10px;outline:none}
+.search:focus{border-color:var(--oak)}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.tile{background:#fff;border:1px solid var(--line);border-radius:var(--r-m);padding:12px 12px 10px;text-align:left;min-height:96px;display:flex;flex-direction:column;justify-content:space-between;position:relative}
+.tile:active{transform:scale(.985);background:var(--paper-2)}
+.tile .nm{font:600 18px/1.12 var(--serif);color:var(--ink);overflow:hidden;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical}
+.tile .pr{font-weight:700;font-size:14px;margin-top:8px}
+.tile .st{font-size:12px;color:var(--ink-2)}
+.tile.low .st{color:var(--red)}
+.tile.zero{opacity:.45}
+.empty{padding:40px 10px;text-align:center;color:var(--ink-2)}
+
+/* ---------- панель кошика і вкладки ---------- */
+.dock{position:fixed;left:0;right:0;bottom:0;z-index:20;background:var(--charcoal);color:var(--chalk);padding-bottom:var(--safe-b);box-shadow:0 -6px 24px rgba(0,0,0,.25)}
+.cartbar{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid rgba(255,255,255,.08);width:100%;text-align:left}
+.cartbar .sum{font:600 24px/1 var(--serif)}
+.cartbar .cnt{font-size:13px;opacity:.8}
+.cartbar .go{background:var(--oak);color:#fff;padding:10px 16px;border-radius:999px;font-weight:700;font-size:14px}
+.tabs{display:flex}
+.tab{flex:1;padding:10px 0 10px;text-align:center;font-size:12px;font-weight:600;opacity:.6}
+.tab .ic{display:block;font-size:20px;line-height:1;margin-bottom:3px}
+.tab.on{opacity:1;color:var(--oak)}
+
+/* ---------- шторки ---------- */
+.veil{position:fixed;inset:0;background:rgba(20,25,20,.55);z-index:30;display:flex;align-items:flex-end;animation:fade .15s}
+.sheet{background:var(--paper);width:100%;border-radius:var(--r-l) var(--r-l) 0 0;padding:14px 16px calc(16px + var(--safe-b));max-height:92vh;overflow:auto;animation:up .2s}
+@keyframes fade{from{opacity:0}} @keyframes up{from{transform:translateY(30px)}}
+@media (prefers-reduced-motion:reduce){.veil,.sheet{animation:none}}
+.sheet .h{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;margin-bottom:8px}
+.sheet .h .t{font:600 24px/1.1 var(--serif)}
+.sheet .h .x{font-size:22px;color:var(--ink-2);padding:2px 6px}
+.sub{color:var(--ink-2);font-size:13px}
+
+/* табло ваг */
+.scale{background:var(--charcoal);color:var(--chalk);border-radius:var(--r-m);padding:14px 16px;margin:12px 0;display:flex;justify-content:space-between;align-items:baseline}
+.scale .g{font:600 40px/1 var(--serif);letter-spacing:.01em}
+.scale .g small{font-size:20px;opacity:.7;margin-left:4px}
+.scale .a{font:600 26px/1 var(--serif);color:var(--oak)}
+.quick{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:10px}
+.quick button{padding:12px 0;border-radius:var(--r-s);background:#fff;border:1px solid var(--line);font-weight:700}
+.quick button:active{background:var(--paper-2)}
+.pad{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.pad button{padding:14px 0;border-radius:var(--r-s);background:#fff;border:1px solid var(--line);font:600 22px/1 var(--serif)}
+.pad button:active{background:var(--paper-2)}
+.pad .fn{font:600 14px var(--sans);color:var(--ink-2)}
+.stepper{display:flex;align-items:center;justify-content:center;gap:18px;margin:14px 0}
+.stepper button{width:56px;height:56px;border-radius:50%;background:#fff;border:1px solid var(--line);font:600 28px/1 var(--serif)}
+.stepper .v{font:600 44px/1 var(--serif);min-width:60px;text-align:center}
+.row{display:flex;gap:10px;margin-top:12px}
+.btn{flex:1;padding:14px;border-radius:var(--r-m);font-weight:700;text-align:center;font-size:15px}
+.btn.oak{background:var(--oak);color:#fff}
+.btn.oak:active{background:var(--oak-deep)}
+.btn.ghost{background:#fff;border:1px solid var(--line);color:var(--ink)}
+.btn.board{background:var(--board);color:var(--chalk)}
+.btn.board:active{background:var(--board-deep)}
+.btn.red{background:#fff;border:1px solid var(--red);color:var(--red)}
+.btn[disabled]{opacity:.4}
+.price-edit{display:flex;align-items:center;gap:8px;margin-top:10px;font-size:14px;color:var(--ink-2)}
+.price-edit input{width:90px;padding:8px 10px;border:1px solid var(--line);border-radius:var(--r-s);text-align:right}
+
+/* кошик */
+.line{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--line);gap:10px}
+.line .n{font:600 17px/1.15 var(--serif)}
+.line .q{font-size:13px;color:var(--ink-2)}
+.line .a{font-weight:700;white-space:nowrap}
+.line .rm{color:var(--red);font-size:20px;padding:4px 8px}
+.total{display:flex;justify-content:space-between;align-items:baseline;padding:14px 0 4px;font:600 20px var(--serif)}
+.total b{font-size:30px}
+
+/* залишки */
+.group{margin:16px 0 6px;font:600 20px/1 var(--serif);color:var(--ink-2)}
+.srow{display:flex;justify-content:space-between;align-items:center;background:#fff;border:1px solid var(--line);border-radius:var(--r-m);padding:12px 14px;margin-bottom:8px;text-align:left;width:100%}
+.srow .n{font:600 18px/1.15 var(--serif)}
+.srow .m{font-size:12px;color:var(--ink-2);margin-top:3px}
+.srow .g{font-weight:700;white-space:nowrap}
+.srow .g small{display:block;font-weight:500;font-size:12px;color:var(--ink-2);text-align:right}
+.warn{color:var(--red)}
+.bt{padding:8px 0;border-bottom:1px solid var(--line);font-size:14px;display:flex;justify-content:space-between}
+
+/* сьогодні */
+.stats{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px}
+.stat{background:#fff;border:1px solid var(--line);border-radius:var(--r-m);padding:12px 14px}
+.stat .n{font:600 26px/1 var(--serif)}
+.stat .l{font-size:12px;color:var(--ink-2);margin-top:4px}
+.bar{margin:8px 0}
+.bar .t{display:flex;justify-content:space-between;gap:10px;font-size:14px}
+.bar .t b{font-family:var(--serif);font-size:17px;white-space:nowrap}
+.bar .b{height:6px;background:var(--paper-2);border-radius:3px;margin-top:4px;overflow:hidden}
+.bar .b i{display:block;height:100%;background:var(--board)}
+.sale{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--line);width:100%;text-align:left}
+.sale .t{font-size:13px;color:var(--ink-2)}
+.sale .a{font:600 19px var(--serif)}
+.sale.x{opacity:.45;text-decoration:line-through}
+.pay{font-size:12px;padding:2px 8px;border-radius:999px;background:var(--paper-2);color:var(--ink-2)}
+
+.toast{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(170px + var(--safe-b));background:var(--board);color:var(--chalk);padding:10px 16px;border-radius:999px;font-weight:600;z-index:40;box-shadow:0 8px 24px rgba(0,0,0,.3)}
+.toast.err{background:var(--red)}
+.loading{padding:60px 20px;text-align:center;color:var(--ink-2);font-family:var(--serif);font-size:22px}
+</style>
+</head>
+<body>
+<div id="app"><div class="loading">Відкриваю касу…</div></div>
+
+<script>
+const tg = window.Telegram?.WebApp; tg?.ready(); tg?.expand();
+try{ tg?.setHeaderColor('#1F3B2C'); tg?.setBackgroundColor('#F6F1E7'); }catch(e){}
+const $ = s => document.querySelector(s);
+const CAT = {cheese:'Сири', meat:"М'ясо", pasta:'Паста'};
+const PAY = {cash:'готівка', card:'картка', other:'інше'};
+const state = {tab:'sale', cat:null, q:'', products:[], today:null, user:null, cart:[], clientKey:null, sheet:null, stock:null};
+
+const eur = v => Number(v).toFixed(2).replace('.',',') + ' €';
+const kg = g => g >= 1000 ? (g/1000).toFixed(3).replace(/\.?0+$/,'').replace('.',',') + ' кг' : g + ' г';
+const money = (grams, priceKg) => Math.round(grams * Number(priceKg) / 10) / 100;   // ROUND_HALF_UP до центів
+const stockOf = p => p.grams - state.cart.filter(l=>l.product_id===p.id).reduce((s,l)=>s+l.grams,0);
+
+async function api(path, body={}){
+  const r = await fetch('/api/'+path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({initData:tg?.initData||'',...body})});
+  const j = await r.json();
+  if(!r.ok) throw new Error(j.error||'Помилка');
+  return j;
+}
+function toast(msg, err){ const t=document.createElement('div'); t.className='toast'+(err?' err':''); t.textContent=msg; document.body.appendChild(t); setTimeout(()=>t.remove(), err?3200:1800); }
+const hap = k => { try{ tg?.HapticFeedback?.impactOccurred(k||'light'); }catch(e){} };
+
+/* ---------------- рендер ---------------- */
+function render(){
+  const s = state, t = s.today || {};
+  $('#app').innerHTML = `
+  <div class="board">
+    <div class="brand">
+      <div class="logo"><b>Crudo &amp; Cotto</b><small>Delikatessen</small></div>
+      <div class="kpi"><div class="n">${eur(t.revenue||0)}</div><div class="l">сьогодні · ${t.sales_count||0} прод.</div></div>
+    </div>
+    <div class="who">${s.user?.name||''} · ${{admin:'адміністратор',manager:'менеджер',seller:'продавець'}[s.user?.role]||''}</div>
+  </div>
+  <div class="screen">${s.tab==='sale'?viewSale():s.tab==='stock'?viewStock():viewToday()}</div>
+  <div class="dock">
+    ${s.tab==='sale'?`<button class="cartbar" onclick="openCart()">
+      <div><div class="sum">${eur(cartTotal())}</div><div class="cnt">${s.cart.length? s.cart.length+' поз. у кошику' : 'кошик порожній'}</div></div>
+      ${s.cart.length?`<span class="go">Оплата</span>`:''}</button>`:''}
+    <div class="tabs">
+      <button class="tab ${s.tab==='sale'?'on':''}" onclick="go('sale')"><span class="ic">🛒</span>Каса</button>
+      <button class="tab ${s.tab==='stock'?'on':''}" onclick="go('stock')"><span class="ic">📦</span>Залишки</button>
+      <button class="tab ${s.tab==='today'?'on':''}" onclick="go('today')"><span class="ic">📈</span>Сьогодні</button>
+    </div>
+  </div>
+  ${s.sheet?`<div class="veil" onclick="if(event.target===this)closeSheet()"><div class="sheet">${s.sheet()}</div></div>`:''}`;
+  const q=$('#q'); if(q&&s._focusQ){q.focus();q.setSelectionRange(q.value.length,q.value.length);}
+}
+function go(tab){ state.tab=tab; state.sheet=null; if(tab==='stock') loadStock(); if(tab==='today') refreshToday(); render(); }
+function closeSheet(){ state.sheet=null; render(); }
+
+/* ---------------- Каса ---------------- */
+function viewSale(){
+  const list = state.products.filter(p => (!state.cat||p.category===state.cat) && (!state.q||p.name.toLowerCase().includes(state.q.toLowerCase())))
+    .sort((a,b)=> (stockOf(b)>0)-(stockOf(a)>0) || a.name.localeCompare(b.name));
+  return `
+  <div class="filters">
+    <button class="chip ${!state.cat?'on':''}" onclick="setCat(null)">Усі</button>
+    ${Object.entries(CAT).map(([k,v])=>`<button class="chip ${state.cat===k?'on':''}" onclick="setCat('${k}')">${v}</button>`).join('')}
+  </div>
+  <input id="q" class="search" placeholder="Пошук товару" value="${state.q.replace(/"/g,'&quot;')}" oninput="state.q=this.value;state._focusQ=true;render()">
+  ${list.length? `<div class="grid">${list.map(tile).join('')}</div>` : `<div class="empty">Нічого не знайдено</div>`}`;
+}
+function tile(p){
+  const have = stockOf(p), unit = p.sale_mode==='piece'?'шт':'кг';
+  const st = p.sale_mode==='piece' ? Math.floor(have/p.piece_grams)+' шт' : kg(Math.max(have,0));
+  const low = p.sale_mode==='piece' ? have < p.piece_grams*3 : have < 500;
+  return `<button class="tile ${have<=0?'zero':low?'low':''}" onclick="openProduct(${p.id})">
+    <span class="nm">${p.name}</span>
+    <span><span class="pr">${eur(p.price)}/${unit}</span><br><span class="st">${have<=0?'немає':'залишок '+st}</span></span></button>`;
+}
+function setCat(c){ state.cat=c; state._focusQ=false; render(); }
+
+let cur=null;
+function openProduct(id){
+  const p = state.products.find(x=>x.id===id); if(!p) return;
+  cur = {p, grams:0, pieces:1, price:p.price, typing:''};
+  state._focusQ=false; state.sheet = sheetProduct; hap(); render();
+}
+function sheetProduct(){
+  const p=cur.p, have=stockOf(p);
+  if(p.sale_mode==='piece'){
+    const amt = Math.round(cur.pieces*Number(cur.price)*100)/100, maxP=Math.floor(have/p.piece_grams);
+    return `<div class="h"><div><div class="t">${p.name}</div><div class="sub">${eur(cur.price)}/шт · ${p.piece_grams} г · є ${maxP} шт</div></div><button class="x" onclick="closeSheet()">✕</button></div>
+      <div class="stepper"><button onclick="step(-1)">−</button><div class="v">${cur.pieces}</div><button onclick="step(1)">+</button></div>
+      <div class="scale"><div class="g">${cur.pieces} <small>шт</small></div><div class="a">${eur(amt)}</div></div>
+      ${priceEdit('шт')}
+      <div class="row"><button class="btn oak" ${cur.pieces>maxP||cur.pieces<1?'disabled':''} onclick="addLine()">Додати в кошик</button></div>`;
+  }
+  const g=cur.grams, amt=money(g,cur.price);
+  return `<div class="h"><div><div class="t">${p.name}</div><div class="sub">${eur(cur.price)}/кг · залишок ${kg(Math.max(have,0))}</div></div><button class="x" onclick="closeSheet()">✕</button></div>
+    <div class="scale"><div class="g">${g} <small>г</small></div><div class="a">${eur(amt)}</div></div>
+    <div class="quick">${[100,150,200,250,300,400,500,1000].map(v=>`<button onclick="setG(${v})">${v>=1000?(v/1000)+' кг':v}</button>`).join('')}</div>
+    <div class="pad">${[1,2,3,4,5,6,7,8,9].map(n=>`<button onclick="key('${n}')">${n}</button>`).join('')}
+      <button class="fn" onclick="key('c')">очистити</button><button onclick="key('0')">0</button><button class="fn" onclick="key('b')">⌫</button></div>
+    ${priceEdit('кг')}
+    <div class="row"><button class="btn oak" ${g<=0||g>have?'disabled':''} onclick="addLine()">${g>have&&g>0?'Більше, ніж є':'Додати в кошик'}</button></div>`;
+}
+function priceEdit(unit){ return `<div class="price-edit">Ціна для цієї позиції, €/${unit}: <input inputmode="decimal" value="${String(cur.price).replace('.',',')}" onchange="cur.price=String(this.value).replace(',','.')||cur.p.price;render()"></div>`; }
+function setG(v){ cur.grams=v; cur.typing=''; hap(); render(); }
+function key(k){
+  if(k==='c') cur.typing=''; else if(k==='b') cur.typing=cur.typing.slice(0,-1); else if(cur.typing.length<5) cur.typing+=k;
+  cur.grams = parseInt(cur.typing||'0',10); render();
+}
+function step(d){ cur.pieces=Math.max(1,cur.pieces+d); hap(); render(); }
+function addLine(){
+  const p=cur.p;
+  const grams = p.sale_mode==='piece' ? cur.pieces*p.piece_grams : cur.grams;
+  const amount = p.sale_mode==='piece' ? Math.round(cur.pieces*Number(cur.price)*100)/100 : money(grams,cur.price);
+  state.cart.push({product_id:p.id,name:p.name,grams,pieces:p.sale_mode==='piece'?cur.pieces:null,price:Number(cur.price),amount,unit:p.sale_mode==='piece'?'шт':'кг'});
+  hap('medium'); state.sheet=null; render(); toast('Додано: '+p.name);
+}
+const cartTotal = () => Math.round(state.cart.reduce((s,l)=>s+l.amount,0)*100)/100;
+function openCart(){ if(!state.cart.length) return; state.sheet=sheetCart; render(); }
+function sheetCart(){
+  return `<div class="h"><div class="t">Покупка</div><button class="x" onclick="closeSheet()">✕</button></div>
+    ${state.cart.map((l,i)=>`<div class="line"><div><div class="n">${l.name}</div><div class="q">${l.pieces?l.pieces+' шт':kg(l.grams)} × ${eur(l.price)}/${l.unit}</div></div><div class="a">${eur(l.amount)}</div><button class="rm" onclick="rmLine(${i})">✕</button></div>`).join('')}
+    <div class="total"><span>Разом</span><b>${eur(cartTotal())}</b></div>
+    <div class="row"><button class="btn board" onclick="pay('cash')">💵 Готівка</button><button class="btn board" onclick="pay('card')">💳 Картка</button></div>
+    <div class="row"><button class="btn ghost" onclick="closeSheet()">Додати ще</button><button class="btn red" onclick="state.cart=[];closeSheet()">Очистити</button></div>`;
+}
+function rmLine(i){ state.cart.splice(i,1); if(!state.cart.length) state.sheet=null; render(); }
+let paying=false;
+async function pay(method){
+  if(paying||!state.cart.length) return; paying=true;
+  try{
+    const r = await api('sale',{lines:state.cart,payment:method,client_key:state.clientKey});
+    state.products=r.products; state.today=r.today;
+    if(r.duplicate){ toast(r.message,true); }
+    else { toast(`Продаж №${r.sale_id} · ${eur(r.total)} · ${PAY[method]}`); hap('heavy'); try{tg?.HapticFeedback?.notificationOccurred('success')}catch(e){} }
+    state.cart=[]; state.clientKey=r.client_key||state.clientKey; state.sheet=null; render();
+  }catch(e){ toast(e.message,true); try{tg?.HapticFeedback?.notificationOccurred('error')}catch(e2){} }
+  finally{ paying=false; }
+}
+
+/* ---------------- Залишки ---------------- */
+async function loadStock(){ try{ state.stock = await api('stock'); render(); }catch(e){ toast(e.message,true); } }
+function viewStock(){
+  const s=state.stock; if(!s) return `<div class="loading">Рахую залишки…</div>`;
+  if(!s.items.length) return `<div class="empty">Залишків немає. Внесіть закупівлю в боті.</div>`;
+  const today=new Date().toISOString().slice(0,10), soon=new Date(Date.now()+7*864e5).toISOString().slice(0,10);
+  let html=`<div class="stat" style="margin-bottom:6px"><div class="n">${eur(s.total_value)}</div><div class="l">закупівельна вартість усіх залишків</div></div>`, cat=null;
+  for(const it of s.items){
+    if(it.category!==cat){ cat=it.category; html+=`<div class="group">${CAT[cat]}</div>`; }
+    const exp = it.expiry ? (it.expiry<today?`<span class="warn">термін минув ${fmtD(it.expiry)}</span>`:it.expiry<=soon?`<span class="warn">до ${fmtD(it.expiry)}</span>`:`до ${fmtD(it.expiry)}`) : '';
+    const pcs = it.sale_mode==='piece'&&it.piece_grams ? ` · ${Math.floor(it.grams/it.piece_grams)} шт` : '';
+    html+=`<button class="srow" onclick="openBatches(${it.id})"><div><div class="n">${it.name}</div><div class="m">${it.batches.length} парт.${pcs} ${exp?'· '+exp:''}</div></div><div class="g">${kg(it.grams)}<small>${eur(it.value)}</small></div></button>`;
+  }
+  return html;
+}
+const fmtD = iso => iso ? iso.slice(8,10)+'.'+iso.slice(5,7)+'.'+iso.slice(0,4) : '—';
+function openBatches(id){
+  const it=state.stock.items.find(x=>x.id===id); state.sheet=()=>`<div class="h"><div><div class="t">${it.name}</div><div class="sub">партії в порядку списання (FIFO)</div></div><button class="x" onclick="closeSheet()">✕</button></div>
+    ${it.batches.map((b,i)=>`<div class="bt"><span>${i+1}. ${b.code||'#'+b.id} · від ${fmtD(b.received)}${b.expiry?' · до '+fmtD(b.expiry):''}</span><b>${kg(b.grams)} · ${String(Number(b.price).toFixed(2)).replace('.',',')} €/кг</b></div>`).join('')}`;
+  render();
+}
+
+/* ---------------- Сьогодні ---------------- */
+async function refreshToday(){ try{ const r=await api('today'); state.today=r.today; state.products=r.products; render(); }catch(e){ toast(e.message,true); } }
+function viewToday(){
+  const t=state.today; if(!t) return `<div class="loading">…</div>`;
+  const max = Math.max(1,...t.top.map(x=>Number(x.amount)));
+  return `<div class="stats">
+      <div class="stat"><div class="n">${eur(t.revenue)}</div><div class="l">виручка</div></div>
+      <div class="stat"><div class="n">${eur(t.gross_profit)}</div><div class="l">валовий прибуток</div></div>
+      <div class="stat"><div class="n">${eur(t.by_payment.cash||0)}</div><div class="l">готівка</div></div>
+      <div class="stat"><div class="n">${eur(t.by_payment.card||0)}</div><div class="l">картка</div></div>
+    </div>
+    ${t.top.length?`<div class="group">Що продавалось</div>`+t.top.map(x=>`<div class="bar"><div class="t"><span>${x.name} <span class="sub">${kg(x.grams)} · маржа ${x.margin.toFixed(0)} %</span></span><b>${eur(x.amount)}</b></div><div class="b"><i style="width:${Number(x.amount)/max*100}%"></i></div></div>`).join(''):''}
+    <div class="group">Продажі за день</div>
+    ${t.sales.length? t.sales.map(s=>`<button class="sale ${s.status==='cancelled'?'x':''}" onclick="openSale(${s.id})"><span class="t">№${s.id} · ${s.time}</span><span><span class="pay">${PAY[s.payment]}</span> <span class="a">${eur(s.total)}</span></span></button>`).join('') : `<div class="empty">Продажів ще не було — відкрийте касу</div>`}`;
+}
+async function openSale(id){
+  try{
+    const s=await api('sale/detail',{sale_id:id});
+    state.sheet=()=>`<div class="h"><div><div class="t">Продаж №${s.id}</div><div class="sub">${s.time} · ${PAY[s.payment]}${s.status==='cancelled'?' · скасовано':''}</div></div><button class="x" onclick="closeSheet()">✕</button></div>
+      ${s.lines.map(l=>`<div class="line"><div><div class="n">${l.name}</div><div class="q">${l.pieces?l.pieces+' шт':kg(l.grams)} × ${eur(l.price)}</div></div><div class="a">${eur(l.amount)}</div></div>`).join('')}
+      <div class="total"><span>Разом</span><b>${eur(s.total)}</b></div>
+      ${s.status==='done'?`<div class="row"><button class="btn red" onclick="cancelSale(${s.id})">Скасувати продаж</button></div>`:''}`;
+    render();
+  }catch(e){ toast(e.message,true); }
+}
+async function cancelSale(id){
+  if(!confirm('Скасувати продаж №'+id+'? Залишки буде повернено.')) return;
+  try{ const r=await api('sale/cancel',{sale_id:id}); state.today=r.today; state.products=r.products; state.sheet=null; render(); toast('Продаж скасовано'); }
+  catch(e){ toast(e.message,true); }
+}
+
+/* ---------------- старт ---------------- */
+(async()=>{
+  try{
+    const r = await api('bootstrap');
+    Object.assign(state,{user:r.user,products:r.products,today:r.today,clientKey:r.client_key});
+    render();
+  }catch(e){
+    $('#app').innerHTML = `<div class="board"><div class="brand"><div class="logo"><b>Crudo &amp; Cotto</b><small>Delikatessen</small></div></div></div><div class="empty" style="font-size:16px">${e.message}<br><br><span class="sub">Відкривайте касу з бота в Telegram.</span></div>`;
+  }
+})();
+</script>
+</body>
+</html>
