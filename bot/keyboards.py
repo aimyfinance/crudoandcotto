@@ -19,34 +19,81 @@ M_PRODUCTS = "🧀 Товари"
 M_BATCHES = "🏷 Партії"
 M_WRITEOFF = "✂️ Списання / коригування"
 M_HISTORY = "🕘 Історія"
-M_REPORTS = "📈 Звіти"
+M_REPORTS = "📊 Усі звіти та Excel"
 M_SETTINGS = "⚙️ Налаштування"
 M_TASKS = "📋 Завдання"
-M_SHIFT_OPEN = "▶️ Відкрити касу"
-M_SHIFT_CLOSE = "⏹ Закрити касу"
+M_SHIFT_OPEN = "▶️ Почати зміну"
+M_SHIFT_CLOSE = "⏹ Завершити зміну"
+
+# групи головного меню
+G_CASH = "🧾 Каса"
+G_PURCH = "📦 Закупівлі"
+G_STOCK = "📊 Склад"
+G_EXP = "💸 Витрати"
+G_REP = "📈 Звіти"
+G_HOME = "🏠 Головне меню"
+# додаткові дії всередині груп
+M_INVOICE = "📄 Закупівля з інвойсу"
+M_PURCH_MANUAL = "✍️ Закупівля вручну"
+M_DOCS_PURCH = "🗂 Інвойси"
+M_EXPIRY = "⏰ Терміни придатності"
+M_OPENING = "➕ Початковий залишок"
+M_EXP_ADD = "➕ Додати витрату"
+M_EXP_LIST = "🗑 Останні витрати"
+M_DOCS_EXP = "🗂 Чеки витрат"
+M_REP_TODAY = "📅 Звіт за сьогодні"
+M_REP_MONTH = "📆 Звіт за місяць"
+M_REP_PERIOD = "🔎 Період"
+GROUPS = {G_CASH, G_PURCH, G_STOCK, G_EXP, G_REP, G_HOME}
 
 ROLE_MENUS = {
-    "admin": [[M_SALE, M_PURCHASE], [M_STOCK, M_PRODUCTS], [M_BATCHES, M_WRITEOFF], [M_HISTORY, M_REPORTS], [M_TASKS, M_SETTINGS]],
-    "manager": [[M_SALE, M_PURCHASE], [M_STOCK, M_PRODUCTS], [M_BATCHES, M_WRITEOFF], [M_HISTORY, M_REPORTS], [M_TASKS, M_SETTINGS]],
-    "seller": [[M_SALE, M_STOCK], [M_HISTORY, M_TASKS]],
+    "admin": [[M_TASKS, G_CASH], [G_PURCH, G_STOCK], [G_EXP, G_REP], [M_SETTINGS]],
+    "manager": [[M_TASKS, G_CASH], [G_PURCH, G_STOCK], [G_EXP, G_REP], [M_SETTINGS]],
+    "seller": [[M_TASKS, G_CASH], [G_STOCK]],
+}
+SUBMENUS = {
+    G_CASH: {"seller": [[M_SALE, M_HISTORY]], "manager": [[M_SALE, M_HISTORY]]},
+    G_PURCH: {"manager": [[M_INVOICE, M_PURCH_MANUAL], [M_BATCHES, M_DOCS_PURCH], [M_PURCHASE + " (останні)"]]},
+    G_STOCK: {"seller": [[M_STOCK, M_EXPIRY], [M_BATCHES]],
+              "manager": [[M_STOCK, M_EXPIRY], [M_WRITEOFF, M_PRODUCTS], [M_BATCHES, M_OPENING]]},
+    G_EXP: {"manager": [[M_EXP_ADD, M_EXP_LIST], [M_DOCS_EXP]]},
+    G_REP: {"manager": [[M_REP_TODAY, M_REP_MONTH], [M_REP_PERIOD, M_REPORTS]]},
 }
 MENU_BUTTONS = {M_SALE, M_PURCHASE, M_STOCK, M_PRODUCTS, M_BATCHES, M_WRITEOFF, M_HISTORY, M_REPORTS, M_SETTINGS, M_TASKS}
 
 
-M_APP = "🧾 Відкрити касу"
+M_APP = "📱 Застосунок каси"
+
+
+def _shift_btn() -> str:
+    try:
+        from .db import get_db
+        return M_SHIFT_CLOSE if S.current_shift(get_db()) else M_SHIFT_OPEN
+    except Exception:
+        return M_SHIFT_OPEN
 
 
 def main_menu(role: str) -> ReplyKeyboardMarkup:
     rows = [[KeyboardButton(text=t) for t in r] for r in ROLE_MENUS.get(role, ROLE_MENUS["seller"])]
-    try:
-        from .db import get_db
-        shift_btn = M_SHIFT_CLOSE if S.current_shift(get_db()) else M_SHIFT_OPEN
-    except Exception:
-        shift_btn = M_SHIFT_OPEN
-    first = [KeyboardButton(text=shift_btn)]
-    if settings.webapp_url:
-        first.insert(0, KeyboardButton(text=M_APP, web_app=WebAppInfo(url=settings.webapp_url + "/app")))
-    rows.insert(0, first)
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+
+def submenu(group: str, role: str) -> ReplyKeyboardMarkup | None:
+    spec = SUBMENUS.get(group)
+    if not spec:
+        return None
+    lvl = "seller" if role == "seller" else "manager"
+    rows_spec = spec.get(lvl)
+    if rows_spec is None:
+        return None
+    rows = []
+    if group == G_CASH:
+        first = [KeyboardButton(text=_shift_btn())]
+        if settings.webapp_url:
+            first.insert(0, KeyboardButton(text=M_APP, web_app=WebAppInfo(url=settings.webapp_url + "/app")))
+        rows.append(first)
+    rows += [[KeyboardButton(text=t) for t in r] for r in rows_spec]
+    rows.append([KeyboardButton(text=G_HOME)])
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 

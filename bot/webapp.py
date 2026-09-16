@@ -181,6 +181,30 @@ async def today(body, user):
 
 
 @api
+async def tasks_list(body, user):
+    db = get_db()
+    rows = S.tasks_for(db, user["telegram_id"], user["role"])
+    return {"tasks": [{"id": t["id"], "text": t["text"], "due": t["due_date"], "assignee": t["assignee_name"] or ("усім" if t["assignee_id"] is None else str(t["assignee_id"])),
+                      "overdue": bool(t["due_date"] and t["due_date"] < today_local())} for t in rows]}
+
+
+@api
+async def task_done(body, user):
+    db = get_db()
+    t = S.task_done(db, int(body["task_id"]), user["telegram_id"])
+    if t and t["created_by"] != user["telegram_id"]:
+        bot = request_bot.get("bot")
+        if bot:
+            try:
+                await bot.send_message(t["created_by"], f"✅ {user['name'] or user['telegram_id']} виконав(ла) завдання №{t['id']}: {t['text']}")
+            except Exception:
+                pass
+    rows = S.tasks_for(db, user["telegram_id"], user["role"])
+    return {"ok": bool(t), "tasks": [{"id": x["id"], "text": x["text"], "due": x["due_date"], "assignee": x["assignee_name"] or "усім",
+                                      "overdue": bool(x["due_date"] and x["due_date"] < today_local())} for x in rows]}
+
+
+@api
 async def shift_toggle(body, user):
     db = get_db()
     import datetime as _dt
@@ -230,4 +254,6 @@ def build_app() -> web.Application:
     app.router.add_post("/api/stock", stock)
     app.router.add_post("/api/today", today)
     app.router.add_post("/api/shift", shift_toggle)
+    app.router.add_post("/api/tasks", tasks_list)
+    app.router.add_post("/api/tasks/done", task_done)
     return app

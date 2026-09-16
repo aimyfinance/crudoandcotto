@@ -7,12 +7,15 @@ from aiogram import F, Router
 from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, Message
+import datetime as dt
+
+from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, Message, WebAppInfo
 
 from .. import services as S
 from ..db import get_db, today_local
 from ..export import build_csv_stock
-from ..keyboards import BACK, CAT_SHORT, M_BATCHES, M_PRODUCTS, M_STOCK, SKIP, inline, main_menu, nav_kb, product_picker
+from ..keyboards import BACK, CAT_SHORT, M_BATCHES, M_EXPIRY, M_OPENING, M_PRODUCTS, M_STOCK, SKIP, inline, main_menu, nav_kb, product_picker
+from ..config import settings
 from ..money import ParseError, d, fmt_grams, fmt_money, fmt_price, parse_money, parse_weight_grams, round_cents
 from .common import Flow, has_role, parse_date, ua_date
 
@@ -21,32 +24,78 @@ router = Router(name="catalog")
 
 # ======================= Залишки =======================
 
+def _short(name: str, n: int = 18) -> str:
+    return name if len(name) <= n else name[: n - 1] + "…"
+
+
 def stock_text(db) -> str:
+    """Компактна таблиця: назва · кг(шт) · € — моноширинним шрифтом, по категоріях, за вагою."""
     rows = S.stock_summary(db)
     if not rows:
         return "Залишків немає."
     out = []
-    cat = None
     total = Decimal(0)
+    by_cat: dict[str, list] = {}
     for r in rows:
-        if r["product"]["category"] != cat:
-            cat = r["product"]["category"]
-            out.append(f"\n<b>{S.CATEGORIES[cat]}</b>")
-        qty = fmt_grams(r["grams"])
-        if r["product"]["sale_mode"] == "piece" and r["product"]["piece_grams"]:
-            qty += f" ({r['grams'] // r['product']['piece_grams']} шт)"
-        exp = f" ⏰{ua_date(r['nearest_expiry'])}" if r["nearest_expiry"] else ""
-        out.append(f"• {r['product']['name']}: <b>{qty}</b> · {fmt_money(r['cost_value'])}{exp}")
+        by_cat.setdefault(r["product"]["category"], []).append(r)
         total += r["cost_value"]
-    out.append(f"\nЗакупівельна вартість залишків: <b>{fmt_money(total)}</b>")
-    return "\n".join(out).strip()
+    for cat in ("meat", "cheese", "pasta"):
+        items = sorted(by_cat.get(cat, []), key=lambda r: -r["grams"])
+        if not items:
+            continue
+        cat_total = sum((r["cost_value"] for r in items), Decimal(0))
+        out.append(f"<b>{S.CATEGORIES[cat]}</b> · {len(items)} поз. · {fmt_money(cat_total)}")
+        lines = []
+        for r in items:
+            p = r["product"]
+            if p["sale_mode"] == "piece" and p["piece_grams"] and r["grams"] >= p["piece_grams"]:
+                qty = f"{r['grams'] // p['piece_grams']:>3} шт"
+            else:
+                qty = f"{r['grams'] / 1000:>5.2f}".replace(".", ",") + " кг" if r["grams"] >= 1000 else f"{r['grams']:>5} г "
+            flag = "⏰" if r["nearest_expiry"] and r["nearest_expiry"] <= (dt.date.today() + dt.timedelta(days=7)).isoformat() else " "
+            lines.append(f"{_short(p['name']):<18} {qty:>8} {float(r['cost_value']):>7.0f}€{flag}")
+        out.append("<pre>" + "\n".join(lines) + "</pre>")
+    out.append(f"Разом: <b>{fmt_grams(sum(r['grams'] for r in rows))}</b> на <b>{fmt_money(total)}</b> (закупівельна)")
+    return "\n".join(out)
 
 
 @router.message(F.text == M_STOCK)
 async def stock(msg: Message, db, user):
-    await msg.answer("📊 <b>Залишки</b>\n" + stock_text(db), reply_markup=main_menu(user["role"]))
-    await msg.answer("Деталі:", reply_markup=inline([[("⏰ Спливає термін (7 днів)", "stock:exp"), ("📄 CSV залишків", "stock:csv")],
-                                                    [("🔎 По товару (партії)", "stock:byprod")]]))
+    await msg.answer("📊 <b>Залишки</b>\n" + stock_text(db))
+    rows = [[("⚠️ Мало на складі", "stock:low"), ("⏰ Спливає термін", "stock:exp")],
+            [("🔎 По товару (партії)", "stock:byprod"), ("📄 CSV", "stock:csv")]]
+    kb = inline(rows)
+    if settings.webapp_url:
+        kb.inline_keyboard.append([InlineKeyboardButton(text="📱 Зручніше — у застосунку", web_app=WebAppInfo(url=settings.webapp_url + "/app"))])
+    await msg.answer("Деталі:", reply_markup=kb)
+
+
+@router.message(StateFilter(None), F.text == M_EXPIRY)
+async def stock_expiry_msg(msg: Message, db):
+    rows = S.batches_expiring(db, 14)
+    if not rows:
+        return await msg.answer("Найближчі 14 днів терміни не спливають.")
+    await msg.answer("⏰ <b>Терміни придатності (14 днів)</b>\n" + "\n".join(
+        f"• {ua_date(r['expiry_date'])} — {r['product_name']}: {fmt_grams(r['grams_left'])}" for r in rows))
+
+
+@router.callback_query(F.data == "stock:low")
+async def stock_low(cb: CallbackQuery, db):
+    rows = [r for r in S.stock_summary(db, include_zero=True)
+            if (r["product"]["sale_mode"] == "piece" and r["product"]["piece_grams"] and r["grams"] < 3 * r["product"]["piece_grams"])
+            or (r["product"]["sale_mode"] == "weight" and r["grams"] < 500)]
+    txt = "⚠️ <b>Мало або немає</b> (менше 500 г / 3 шт)\n" + ("\n".join(
+        f"• {r['product']['name']}: {fmt_grams(r['grams']) if r['grams'] else 'немає'}" for r in rows) if rows else "усього достатньо")
+    await cb.message.answer(txt)
+    await cb.answer()
+
+
+@router.message(StateFilter(None), F.text == M_OPENING)
+async def opening_start_msg(msg: Message, state: FSMContext, user):
+    if not has_role(user, "manager"):
+        return await msg.answer("Недостатньо прав")
+    await state.clear()
+    await oflow.goto(msg, state, Opening.product, push=False)
 
 
 @router.callback_query(F.data == "stock:exp")

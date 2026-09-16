@@ -11,7 +11,7 @@ from aiogram.types import CallbackQuery, Message
 
 from .. import services as S
 from ..db import get_db, today_local
-from ..keyboards import BACK, M_PURCHASE, SKIP, TODAY, inline, main_menu, nav_kb, product_picker
+from ..keyboards import BACK, M_PURCHASE, M_PURCH_MANUAL, M_INVOICE, SKIP, TODAY, inline, main_menu, nav_kb, product_picker
 from ..money import ParseError, fmt_grams, fmt_money, fmt_price, line_amount, parse_money, parse_weight_grams
 from .common import Flow, has_role, parse_date, ua_date
 
@@ -117,7 +117,16 @@ def summary_text(data) -> str:
     return "\n".join(out)
 
 
-@router.message(F.text == M_PURCHASE)
+@router.message(StateFilter(None), F.text == M_PURCHASE + " (останні)")
+async def recent(msg: Message, db, user):
+    rows = S.recent_purchases(db, 10)
+    if not rows:
+        return await msg.answer("Закупівель ще немає.")
+    await msg.answer("📦 <b>Останні закупівлі</b>\n" + "\n".join(
+        f"№{p['id']} {ua_date(p['doc_date'])} {p['supplier_name'] or ''} — {p['status']}" + (f" · {p['comment']}" if p["comment"] else "") for p in rows))
+
+
+@router.message(F.text.in_({M_PURCHASE, M_PURCH_MANUAL}))
 async def start(msg: Message, state: FSMContext, user):
     if not has_role(user, "manager"):
         return await msg.answer("Закупівлі доступні менеджеру й адміністратору.")
@@ -297,18 +306,30 @@ class Inv(StatesGroup):
 MIME_BY_EXT = {".pdf": "application/pdf", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}
 
 
-@router.callback_query(F.data == "pur:invoice")  # доступна зі стану Pur.date і без стану
-async def inv_start(cb: CallbackQuery, state: FSMContext, user):
+async def _inv_begin(target: Message, state: FSMContext, user) -> str | None:
     if not has_role(user, "manager"):
-        return await cb.answer("Недостатньо прав", show_alert=True)
+        return "Недостатньо прав"
     import os
     if not os.getenv("ANTHROPIC_API_KEY"):
-        return await cb.answer("Не задано ANTHROPIC_API_KEY на сервері — розпізнавання вимкнено", show_alert=True)
+        return "Не задано ANTHROPIC_API_KEY на сервері — розпізнавання вимкнено"
     await state.clear()
     await state.set_state(Inv.file)
-    await cb.message.answer("📄 Надішліть інвойс: PDF або фото (як документ чи як фото). Можна кілька сторінок — по одній.",
-                            reply_markup=nav_kb(back=False))
-    await cb.answer()
+    await target.answer("📄 Надішліть інвойс: PDF або фото (як документ чи як фото). Можна кілька сторінок — по одній.",
+                        reply_markup=nav_kb(back=False))
+    return None
+
+
+@router.callback_query(F.data == "pur:invoice")  # доступна зі стану Pur.date і без стану
+async def inv_start(cb: CallbackQuery, state: FSMContext, user):
+    err = await _inv_begin(cb.message, state, user)
+    await cb.answer(err, show_alert=True) if err else await cb.answer()
+
+
+@router.message(StateFilter(None), F.text == M_INVOICE)
+async def inv_start_msg(msg: Message, state: FSMContext, user):
+    err = await _inv_begin(msg, state, user)
+    if err:
+        await msg.answer(f"⚠️ {err}")
 
 
 @router.message(StateFilter(Inv.file), F.document | F.photo)

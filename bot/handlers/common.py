@@ -12,7 +12,7 @@ from aiogram.types import CallbackQuery, Message, TelegramObject, Update
 from .. import services as S
 from ..config import settings
 from ..db import get_db, today_local
-from ..keyboards import BACK, CANCEL, main_menu
+from ..keyboards import BACK, CANCEL, G_CASH, G_EXP, G_HOME, G_PURCH, G_REP, G_STOCK, GROUPS, main_menu, submenu
 
 router = Router(name="common")
 
@@ -176,6 +176,27 @@ async def cmd_help(msg: Message, user):
 @router.message(StateFilter("*"), F.text == CANCEL)
 async def cancel_any(msg: Message, state: FSMContext, user):
     await cancel_to_menu(msg, state, user)
+
+
+GROUP_TITLES = {G_CASH: "🧾 Каса", G_PURCH: "📦 Закупівлі", G_STOCK: "📊 Склад", G_EXP: "💸 Витрати", G_REP: "📈 Звіти"}
+
+
+@router.message(F.text.in_(GROUPS))
+async def open_group(msg: Message, state: FSMContext, user):
+    await state.clear()
+    if msg.text == G_HOME:
+        return await msg.answer(role_menu_text(user), reply_markup=main_menu(user["role"]))
+    kb = submenu(msg.text, user["role"])
+    if kb is None:
+        return await msg.answer("Цей розділ недоступний для вашої ролі.", reply_markup=main_menu(user["role"]))
+    hint = ""
+    if msg.text == G_CASH:
+        from .. import services as _S
+        from ..db import get_db as _g
+        sh = _S.current_shift(_g())
+        from ..db import local_dt_str as _l
+        hint = f"\nЗміна відкрита о {_l(sh['opened_at'])[-5:]} · {sh['opened_name'] or ''}" if sh else "\nЗміна не відкрита"
+    await msg.answer(GROUP_TITLES[msg.text] + hint, reply_markup=kb)
 
 
 @router.callback_query(F.data == "noop")

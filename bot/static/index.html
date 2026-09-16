@@ -163,7 +163,7 @@ try{ tg?.setHeaderColor('#1F3B2C'); tg?.setBackgroundColor('#F6F1E7'); }catch(e)
 const $ = s => document.querySelector(s);
 const CAT = {cheese:'Сири', meat:"М'ясо", pasta:'Паста'};
 const PAY = {cash:'готівка', card:'картка', other:'інше'};
-const state = {tab:'sale', cat:null, q:'', products:[], today:null, user:null, cart:[], clientKey:null, sheet:null, stock:null};
+const state = {tab:'sale', cat:null, q:'', products:[], today:null, user:null, cart:[], clientKey:null, sheet:null, stock:null, tasks:null};
 
 const eur = v => Number(v).toFixed(2).replace('.',',') + ' €';
 const kg = g => g >= 1000 ? (g/1000).toFixed(3).replace(/\.?0+$/,'').replace('.',',') + ' кг' : g + ' г';
@@ -190,7 +190,7 @@ function render(){
     </div>
     <div class="who">${s.user?.name||''} · ${{admin:'адміністратор',manager:'менеджер',seller:'продавець'}[s.user?.role]||''}</div>
   </div>
-  <div class="screen">${s.tab==='sale'?viewSale():s.tab==='stock'?viewStock():viewToday()}</div>
+  <div class="screen">${s.tab==='sale'?viewSale():s.tab==='stock'?viewStock():s.tab==='tasks'?viewTasks():viewToday()}</div>
   <div class="dock">
     ${s.tab==='sale'?`<button class="cartbar" onclick="openCart()">
       <div><div class="sum">${eur(cartTotal())}</div><div class="cnt">${s.cart.length? s.cart.length+' поз. у кошику' : 'кошик порожній'}</div></div>
@@ -199,12 +199,22 @@ function render(){
       <button class="tab ${s.tab==='sale'?'on':''}" onclick="go('sale')"><span class="ic">🛒</span>Каса</button>
       <button class="tab ${s.tab==='stock'?'on':''}" onclick="go('stock')"><span class="ic">📦</span>Залишки</button>
       <button class="tab ${s.tab==='today'?'on':''}" onclick="go('today')"><span class="ic">📈</span>Сьогодні</button>
+      <button class="tab ${s.tab==='tasks'?'on':''}" onclick="go('tasks')"><span class="ic">📋</span>Завдання${s.tasks&&s.tasks.length?` <b>${s.tasks.length}</b>`:''}</button>
     </div>
   </div>
   ${s.sheet?`<div class="veil" onclick="if(event.target===this)closeSheet()"><div class="sheet">${s.sheet()}</div></div>`:''}`;
   const q=$('#q'); if(q&&s._focusQ){q.focus();q.setSelectionRange(q.value.length,q.value.length);}
 }
-function go(tab){ state.tab=tab; state.sheet=null; if(tab==='stock') loadStock(); if(tab==='today') refreshToday(); render(); }
+function go(tab){ state.tab=tab; state.sheet=null; if(tab==='stock') loadStock(); if(tab==='today') refreshToday(); if(tab==='tasks') loadTasks(); render(); }
+
+/* ---------------- Завдання ---------------- */
+async function loadTasks(){ try{ state.tasks=(await api('tasks')).tasks; render(); }catch(e){ toast(e.message,true); } }
+function viewTasks(){
+  const t=state.tasks; if(!t) return `<div class="loading">…</div>`;
+  if(!t.length) return `<div class="empty">Відкритих завдань немає 🎉</div>`;
+  return `<div class="group">Мої завдання</div>`+t.map(x=>`<div class="line"><div><div class="n">${x.text}</div><div class="q">${x.assignee}${x.due?' · до '+fmtD(x.due):''}${x.overdue?' <span class="warn">прострочено</span>':''}</div></div><button class="btn oak" style="flex:0 0 auto;padding:10px 14px" onclick="doneTask(${x.id})">✅</button></div>`).join('');
+}
+async function doneTask(id){ try{ const r=await api('tasks/done',{task_id:id}); state.tasks=r.tasks; render(); toast('Виконано'); hap('medium'); }catch(e){ toast(e.message,true); } }
 function closeSheet(){ state.sheet=null; render(); }
 
 /* ---------------- Каса ---------------- */
@@ -358,7 +368,7 @@ async function cancelSale(id){
   try{
     const r = await api('bootstrap');
     Object.assign(state,{user:r.user,products:r.products,today:r.today,clientKey:r.client_key});
-    render();
+    render(); loadTasks();
   }catch(e){
     $('#app').innerHTML = `<div class="board"><div class="brand"><div class="logo"><b>Crudo &amp; Cotto</b><small>Delikatessen</small></div></div></div><div class="empty" style="font-size:16px">${e.message}<br><br><span class="sub">Відкривайте касу з бота в Telegram.</span></div>`;
   }

@@ -16,7 +16,8 @@ from .. import services as S
 from ..cash_import import parse_cash_report
 from ..config import TZ, settings
 from ..export import build_csv_movements, build_excel
-from ..keyboards import CANCEL, M_REPORTS, M_SETTINGS, inline, main_menu, nav_kb, product_picker
+from ..keyboards import (CANCEL, M_DOCS_EXP, M_DOCS_PURCH, M_EXP_ADD, M_EXP_LIST, M_REP_MONTH, M_REP_PERIOD, M_REP_TODAY,
+                         M_REPORTS, M_SETTINGS, inline, main_menu, nav_kb, product_picker)
 from ..money import fmt_grams, fmt_money
 from ..db import today_local, get_db
 from .common import Flow, has_role, parse_date, parse_period, ua_date
@@ -122,6 +123,51 @@ async def reports(msg: Message, state: FSMContext, user):
     await msg.answer("📈 <b>Звіти</b> — оберіть період:", reply_markup=main_menu(user["role"]))
     await msg.answer("Період:", reply_markup=period_kb())
     await msg.answer("Витрати:", reply_markup=inline([[("➕ Додати витрату", "exp:add"), ("🗑 Останні витрати", "exp:list")]]))
+
+
+@router.message(StateFilter(None), F.text.in_({M_REP_TODAY, M_REP_MONTH}))
+async def rep_quick(msg: Message, db, user):
+    if not has_role(user, "manager"):
+        return
+    await _send_report(msg, db, user, *_period("today" if msg.text == M_REP_TODAY else "month"))
+
+
+@router.message(StateFilter(None), F.text == M_REP_PERIOD)
+async def rep_period_btn(msg: Message, state: FSMContext, user):
+    if not has_role(user, "manager"):
+        return
+    await state.set_state(Rep.period)
+    await msg.answer("Введіть період: <code>01.09.2026 - 15.09.2026</code> або одну дату:", reply_markup=nav_kb(back=False))
+
+
+@router.message(StateFilter(None), F.text == M_EXP_ADD)
+async def exp_add_msg(msg: Message, state: FSMContext, user):
+    if not has_role(user, "manager"):
+        return
+    await state.clear()
+    await eflow.goto(msg, state, Exp.date, push=False)
+
+
+@router.message(StateFilter(None), F.text == M_EXP_LIST)
+async def exp_list_msg(msg: Message, db, user):
+    rows = S.recent_expenses(db, 10)
+    if not rows:
+        return await msg.answer("Витрат ще немає.")
+    await msg.answer("💸 <b>Останні витрати</b> (натисніть, щоб видалити помилкову):", reply_markup=inline(
+        [[(f"{ua_date(r['op_date'])} {r['category'][:22]} {fmt_money(r['amount'])}", f"exp:del:{r['id']}")] for r in rows]))
+
+
+@router.message(StateFilter(None), F.text.in_({M_DOCS_PURCH, M_DOCS_EXP}))
+async def docs_msg(msg: Message, db, user):
+    if not has_role(user, "manager"):
+        return
+    kind = "purchase" if msg.text == M_DOCS_PURCH else "expense"
+    rows = S.list_documents(db, kind)
+    if not rows:
+        return await msg.answer("Документів ще немає.")
+    from ..db import local_dt_str as _l
+    await msg.answer("📁 Останні документи (натисніть, щоб отримати файл):", reply_markup=inline(
+        [[(f"№{d['ref_id'] or '—'} · {_l(d['uploaded_at'])[:10]} · {d['file_name'][:24]}", f"docs:get:{d['id']}")] for d in rows]))
 
 
 @router.callback_query(F.data == "rep:custom")
