@@ -33,6 +33,7 @@ class Pur(StatesGroup):
 
 async def p_date(msg, state):
     await msg.answer("📦 Дата закупівлі (наприклад 15.09.2026):", reply_markup=nav_kb(TODAY, back=False))
+    await msg.answer("Або завантажте документ:", reply_markup=inline([[("📄 Закупівля з інвойсу (PDF/фото)", "pur:invoice")]]))
 
 
 async def p_supplier(msg, state):
@@ -274,5 +275,235 @@ async def confirm(cb: CallbackQuery, state: FSMContext, user, db):
     except Exception:
         pass
     await cb.message.answer(f"✅ Закупівлю №{pid} проведено, залишки збільшено ({len(lines)} партій).",
+                            reply_markup=main_menu(user["role"]))
+    await cb.answer()
+
+
+# ======================= закупівля з інвойсу (PDF/фото) =======================
+
+import asyncio
+from aiogram.types import BufferedInputFile
+
+
+class Inv(StatesGroup):
+    file = State()
+    review = State()
+    line_product = State()
+    line_weight = State()
+    line_price = State()
+    transport = State()
+
+
+MIME_BY_EXT = {".pdf": "application/pdf", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}
+
+
+@router.callback_query(F.data == "pur:invoice")  # доступна зі стану Pur.date і без стану
+async def inv_start(cb: CallbackQuery, state: FSMContext, user):
+    if not has_role(user, "manager"):
+        return await cb.answer("Недостатньо прав", show_alert=True)
+    import os
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        return await cb.answer("Не задано ANTHROPIC_API_KEY на сервері — розпізнавання вимкнено", show_alert=True)
+    await state.clear()
+    await state.set_state(Inv.file)
+    await cb.message.answer("📄 Надішліть інвойс: PDF або фото (як документ чи як фото). Можна кілька сторінок — по одній.",
+                            reply_markup=nav_kb(back=False))
+    await cb.answer()
+
+
+@router.message(StateFilter(Inv.file), F.document | F.photo)
+async def inv_file(msg: Message, state: FSMContext, db, user):
+    from ..invoice import extract_invoice, build_draft
+    import io, os
+    buf = io.BytesIO()
+    if msg.document:
+        ext = os.path.splitext(msg.document.file_name or "")[1].lower()
+        mime = MIME_BY_EXT.get(ext) or msg.document.mime_type or ""
+        if mime not in MIME_BY_EXT.values():
+            return await msg.answer("⚠️ Підтримуються PDF, JPG, PNG, WEBP")
+        await msg.bot.download(msg.document, destination=buf)
+    else:
+        mime = "image/jpeg"
+        await msg.bot.download(msg.photo[-1], destination=buf)
+    wait = await msg.answer("🔎 Розпізнаю інвойс… (10–30 с)")
+    try:
+        parsed = await asyncio.to_thread(extract_invoice, buf.getvalue(), mime)
+        draft = build_draft(parsed)
+    except Exception as e:
+        return await msg.answer(f"⚠️ Не вдалося розпізнати: {e}")
+    await state.update_data(draft=draft, inv_bytes=buf.getvalue().hex()[:0])  # файл не зберігаємо в стані (обсяг)
+    await state.set_state(Inv.review)
+    await _inv_review(msg, state)
+
+
+def _line_text(i: int, l: dict) -> str:
+    mark = {"alias": "🔗", "exact": "✅", "auto": "🔸", "none": "❌"}[l["how"]]
+    if l.get("skip"):
+        mark = "⏭"
+    w = fmt_grams(l["grams"]) if l["grams"] else "— кг"
+    pr = f"{fmt_price(l['price'])} €/кг" if l["price"] else "— €/кг"
+    amt = fmt_money(l["amount"]) if l["amount"] else "—"
+    iss = f" ⚠️ {'; '.join(l['issues'])}" if l["issues"] and not l.get("skip") else ""
+    return f"{mark} {i + 1}. {l['description'][:40]} → <b>{l['product_name'] or 'не знайдено'}</b>\n     {w} × {pr} = {amt}{iss}"
+
+
+async def _inv_review(msg: Message, state: FSMContext):
+    data = await state.get_data()
+    d = data["draft"]
+    total_g = sum(l["grams"] or 0 for l in d["lines"] if not l.get("skip"))
+    txt = [f"📄 <b>{d['supplier'] or 'Постачальник?'}</b> · №{d.get('number') or '—'} · {ua_date(d.get('date')) if d.get('date') else 'дата?'}"]
+    txt += [_line_text(i, l) for i, l in enumerate(d["lines"])]
+    txt.append(f"\nТовар: <b>{fmt_money(d['sum_lines'])}</b> · {fmt_grams(total_g)} · транспорт/інше: {fmt_money(Decimal(d['transport']) + Decimal(d['other_costs']))}")
+    for name, ok, detail in d["checks"]:
+        txt.append(f"{'✅' if ok else '⚠️'} {name} ({detail})")
+    txt.append("\n✅ точний збіг · 🔗 збережена прив'язка · 🔸 підібрано автоматично — перевірте · ❌ не знайдено")
+    await msg.answer("\n".join(txt))
+    kb = [[(f"✏️ {i + 1}", f"inv:line:{i}") for i in range(j, min(j + 5, len(d["lines"])))] for j in range(0, len(d["lines"]), 5)]
+    kb.append([("🚚 Транспорт / інші витрати", "inv:transport")])
+    ready = any(l["product_id"] and l["grams"] and l["price"] and not l.get("skip") for l in d["lines"])
+    kb.append([("✅ Оприбуткувати", "inv:post")] if ready else [("(немає готових позицій)", "noop")])
+    await msg.answer("Дія:", reply_markup=inline(kb))
+
+
+@router.callback_query(StateFilter(Inv.review), F.data.startswith("inv:line:"))
+async def inv_line(cb: CallbackQuery, state: FSMContext):
+    i = int(cb.data.split(":")[2])
+    await state.update_data(inv_i=i)
+    d = (await state.get_data())["draft"]
+    l = d["lines"][i]
+    await cb.message.answer(_line_text(i, l), reply_markup=inline([
+        [("🧀 Товар", f"inv:edit:product"), ("⚖️ Вага", f"inv:edit:weight"), ("💶 Ціна/кг", f"inv:edit:price")],
+        [("▶️ Пропустити позицію" if not l.get("skip") else "↩️ Повернути позицію", "inv:edit:skip"), ("➕ Створити товар", "inv:edit:new")],
+    ]))
+    await cb.answer()
+
+
+@router.callback_query(StateFilter(Inv.review), F.data.startswith("inv:edit:"))
+async def inv_edit(cb: CallbackQuery, state: FSMContext, db, user):
+    what = cb.data.split(":")[2]
+    data = await state.get_data()
+    d, i = data["draft"], data["inv_i"]
+    if what == "product":
+        await state.set_state(Inv.line_product)
+        await cb.message.answer(f"Який товар бота відповідає «{d['lines'][i]['description']}»?",
+                                reply_markup=product_picker(db, "iv", show_price=False))
+    elif what == "weight":
+        await state.set_state(Inv.line_weight)
+        await cb.message.answer("Вага позиції (кг або г):", reply_markup=nav_kb(back=False))
+    elif what == "price":
+        await state.set_state(Inv.line_price)
+        await cb.message.answer("Ціна за кг, €:", reply_markup=nav_kb(back=False))
+    elif what == "skip":
+        d["lines"][i]["skip"] = not d["lines"][i].get("skip")
+        await state.update_data(draft=d)
+        await _inv_review(cb.message, state)
+    elif what == "new":
+        l = d["lines"][i]
+        cat = "meat"
+        low = l["description"].lower()
+        if any(k in low for k in ("taleggio", "asiago", "bosina", "tur", "chevre", "pecorino", "formagg", "brie", "mozzar", "burrat", "parmig", "provol", "raclette", "gorgon")):
+            cat = "cheese"
+        if any(k in low for k in ("gnocchi", "ravioli", "tortell", "pasta", "cappell")):
+            cat = "pasta"
+        pid = S.create_product(db, l["description"][:80].title(), cat, "weight", Decimal(0))
+        l["product_id"], l["product_name"], l["how"] = pid, S.get_product(db, pid)["name"], "exact"
+        await state.update_data(draft=d)
+        await cb.message.answer(f"✅ Створено товар «{l['product_name']}» ({S.CATEGORIES[cat]}, на вагу, роздрібна ціна 0 — задайте в «Товари»).")
+        await _inv_review(cb.message, state)
+    await cb.answer()
+
+
+@router.callback_query(StateFilter(Inv.line_product), F.data.startswith("pp:iv:"))
+async def inv_pick(cb: CallbackQuery, state: FSMContext, db):
+    parts = cb.data.split(":")
+    if parts[2] in ("cat", "pg"):
+        cat = parts[3] if parts[2] == "cat" else (parts[4] or None)
+        page = int(parts[3]) if parts[2] == "pg" else 0
+        await cb.message.edit_reply_markup(reply_markup=product_picker(db, "iv", cat, page, show_price=False))
+        return await cb.answer()
+    data = await state.get_data()
+    d, i = data["draft"], data["inv_i"]
+    p = S.get_product(db, int(parts[3]))
+    d["lines"][i].update(product_id=p["id"], product_name=p["name"], how="alias")
+    await state.update_data(draft=d)
+    await state.set_state(Inv.review)
+    await cb.answer("Прив'язано")
+    await _inv_review(cb.message, state)
+
+
+@router.message(StateFilter(Inv.line_weight), F.text)
+async def inv_weight(msg: Message, state: FSMContext):
+    try:
+        g = parse_weight_grams(msg.text)
+    except ParseError as e:
+        return await msg.answer(f"⚠️ {e}")
+    data = await state.get_data()
+    d, i = data["draft"], data["inv_i"]
+    l = d["lines"][i]
+    l["grams"] = g
+    l["issues"] = [x for x in l["issues"] if x != "немає ваги"]
+    if l["price"]:
+        l["amount"] = str(line_amount(g, Decimal(l["price"])))
+    d["sum_lines"] = str(sum((Decimal(x["amount"]) for x in d["lines"] if x["amount"]), Decimal(0)))
+    await state.update_data(draft=d)
+    await state.set_state(Inv.review)
+    await _inv_review(msg, state)
+
+
+@router.message(StateFilter(Inv.line_price), F.text)
+async def inv_price(msg: Message, state: FSMContext):
+    try:
+        p = parse_money(msg.text)
+    except ParseError as e:
+        return await msg.answer(f"⚠️ {e}")
+    data = await state.get_data()
+    d, i = data["draft"], data["inv_i"]
+    l = d["lines"][i]
+    l["price"] = str(p)
+    l["issues"] = [x for x in l["issues"] if x != "немає ціни"]
+    if l["grams"]:
+        l["amount"] = str(line_amount(l["grams"], p))
+    d["sum_lines"] = str(sum((Decimal(x["amount"]) for x in d["lines"] if x["amount"]), Decimal(0)))
+    await state.update_data(draft=d)
+    await state.set_state(Inv.review)
+    await _inv_review(msg, state)
+
+
+@router.callback_query(StateFilter(Inv.review), F.data == "inv:transport")
+async def inv_transport(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(Inv.transport)
+    d = (await state.get_data())["draft"]
+    await cb.message.answer(f"🚚 Транспорт та інші закупівельні витрати, € (зараз {fmt_money(Decimal(d['transport']) + Decimal(d['other_costs']))}). "
+                            "Розподіляться на позиції пропорційно вазі:", reply_markup=nav_kb(back=False))
+    await cb.answer()
+
+
+@router.message(StateFilter(Inv.transport), F.text)
+async def inv_transport_val(msg: Message, state: FSMContext):
+    try:
+        v = parse_money(msg.text)
+    except ParseError as e:
+        return await msg.answer(f"⚠️ {e}")
+    data = await state.get_data()
+    d = data["draft"]
+    d["transport"], d["other_costs"] = str(v), "0"
+    await state.update_data(draft=d)
+    await state.set_state(Inv.review)
+    await _inv_review(msg, state)
+
+
+@router.callback_query(StateFilter(Inv.review), F.data == "inv:post")
+async def inv_post(cb: CallbackQuery, state: FSMContext, db, user):
+    from ..invoice import post_draft
+    d = (await state.get_data())["draft"]
+    try:
+        pid = post_draft(d, user["telegram_id"])
+    except ValueError as e:
+        return await cb.answer(str(e), show_alert=True)
+    n = sum(1 for l in d["lines"] if l["product_id"] and l["grams"] and l["price"] and not l.get("skip"))
+    skipped = len(d["lines"]) - n
+    await state.clear()
+    await cb.message.answer(f"✅ Закупівлю №{pid} оприбутковано: {n} партій" + (f", пропущено {skipped} поз." if skipped else "") +
+                            ". Прив'язки назв постачальника збережено — наступний інвойс розпізнається без правок.",
                             reply_markup=main_menu(user["role"]))
     await cb.answer()

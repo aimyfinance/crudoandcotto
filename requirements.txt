@@ -4,3 +4,4 @@ openpyxl>=3.1
 aiohttp>=3.9
 pytest>=8
 pytest-asyncio>=0.23
+anthropic>=0.40

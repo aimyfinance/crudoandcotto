@@ -14,7 +14,7 @@ import json
 from dataclasses import dataclass, field
 from decimal import Decimal
 
-from .db import Database, now_utc, today_local, local_date_of
+from .db import Database, now_utc, today_local, local_date_of  # noqa: F401
 from .money import ZERO, d, round_cents, line_amount, piece_amount, PRICE_PREC
 
 CATEGORIES = {"cheese": "Сир", "meat": "М'ясні вироби", "pasta": "Паста / напівфабрикати"}
