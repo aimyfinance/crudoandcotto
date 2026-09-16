@@ -297,3 +297,145 @@ def import_expenses(name: str, data: bytes, user_id: int) -> tuple[int, int, lis
         S.add_expense(db, user_id, d_, t, row["category"], amt, row.get("comment") or None)
         created += 1
     return created, skipped, errors
+
+
+# ======================= імпорт чеків Octobox (по позиціях) =======================
+
+def parse_octobox_lines(name: str, data: bytes) -> list[dict]:
+    """Експорт Octobox «по позиціях» (колонки Number, Rechnungs-/Belegsdatum, Produkt, Produktgruppe,
+    Zahlungsmethode, Rückerstattung, Betrag, Gewicht (kg) — насправді грами).
+    -> список чеків: {number, dt (datetime, Відень), payment, refund, lines:[{name, group, grams, amount}]}"""
+    import datetime as dt
+    import io
+    from openpyxl import load_workbook
+    ws = load_workbook(io.BytesIO(data), read_only=True, data_only=True).active
+    rows = list(ws.iter_rows(values_only=True))
+    hdr_i, cols = None, {}
+    for i, r in enumerate(rows[:30]):
+        names = [str(c or "").strip().lower() for c in r]
+        if "produkt" in names and "betrag" in names and any(n.startswith("rechnungs") or n == "datum" for n in names):
+            hdr_i = i
+            for j, n in enumerate(names):
+                cols.setdefault(n, j)
+            break
+    if hdr_i is None:
+        raise ValueError("Це не експорт Octobox по позиціях: потрібні колонки Produkt, Betrag, Rechnungs-/Belegsdatum, Gewicht (kg).")
+    c_num = cols.get("number"); c_dt = cols.get("rechnungs-/belegsdatum", cols.get("datum")); c_prod = cols["produkt"]
+    c_grp = cols.get("produktgruppe"); c_pay = cols.get("zahlungsmethode"); c_ref = cols.get("rückerstattung")
+    c_amt = cols["betrag"]; c_w = cols.get("gewicht (kg)")
+    receipts: dict[str, dict] = {}
+    for r in rows[hdr_i + 1:]:
+        if not r or not r[c_prod] or r[c_amt] is None:
+            continue
+        num = str(r[c_num]).strip()
+        d = r[c_dt]
+        if isinstance(d, str):
+            d = dt.datetime.strptime(d[:19], "%d.%m.%Y %H:%M:%S")
+        pay_raw = str(r[c_pay] or "").lower()
+        payment = "card" if any(w in pay_raw for w in ("kart", "card")) else "cash"
+        refund = str(r[c_ref] or "").lower().startswith("ja") if c_ref is not None else False
+        amount = Decimal(str(r[c_amt]))
+        w = r[c_w] if c_w is not None else None
+        grams = int(round(float(w))) if w not in (None, "", 0) else 0
+        rec = receipts.setdefault(num, {"number": num, "dt": d, "payment": payment, "refund": False, "lines": []})
+        rec["refund"] = rec["refund"] or refund or amount < 0
+        rec["lines"].append({"name": str(r[c_prod]).strip(), "group": r[c_grp] if c_grp is not None else None,
+                             "grams": grams, "amount": amount})
+    return sorted(receipts.values(), key=lambda x: (x["dt"], int(x["number"]) if x["number"].isdigit() else 0))
+
+
+def octobox_summary(receipts: list[dict]) -> dict:
+    """Що є у файлі: діапазон дат, кількість чеків, назви товарів і як вони зіставляються."""
+    db = get_db()
+    names: dict[str, int] = {}
+    for rc in receipts:
+        for l in rc["lines"]:
+            names[l["name"]] = names.get(l["name"], 0) + 1
+    matches = {}
+    for nm in names:
+        pid, how = S.match_product(db, nm)
+        matches[nm] = {"product_id": pid, "how": how, "count": names[nm],
+                       "product_name": S.get_product(db, pid)["name"] if pid else None}
+    return {"count": len(receipts), "date_from": receipts[0]["dt"].date().isoformat() if receipts else None,
+            "date_to": receipts[-1]["dt"].date().isoformat() if receipts else None, "matches": matches,
+            "days": sorted({rc["dt"].date().isoformat() for rc in receipts})}
+
+
+def last_octobox_date(db) -> str | None:
+    r = db.one("SELECT MAX(sale_date) AS d FROM sales WHERE client_key LIKE 'octobox:%'")
+    return r["d"] if r and r["d"] else None
+
+
+def import_octobox(receipts: list[dict], user_id: int, since: str | None = None, skip_unmatched: bool = True) -> dict:
+    """Створює продажі з чеків. Ідемпотентно (client_key = octobox:<номер чека>).
+    Сторно-чек: шукає імпортований чек того ж дня з тією ж сумою і скасовує його."""
+    from .config import TZ
+    from .money import round_cents
+    db = get_db()
+    st = {"created": 0, "skipped_dup": 0, "skipped_old": 0, "refunds": 0, "refunds_unmatched": [],
+          "unmatched": {}, "shortfalls": []}
+    cache: dict[str, int | None] = {}
+    for rc in receipts:
+        day = rc["dt"].date().isoformat()
+        if since and day < since:
+            st["skipped_old"] += 1
+            continue
+        key = f"octobox:{rc['number']}"
+        if db.one("SELECT 1 FROM sales WHERE client_key=?", (key,)):
+            st["skipped_dup"] += 1
+            continue
+        total = sum((l["amount"] for l in rc["lines"]), Decimal(0))
+        if rc["refund"]:
+            target = db.one("SELECT id FROM sales WHERE status='done' AND client_key LIKE 'octobox:%' AND sale_date=? AND total=? "
+                            "ORDER BY id DESC LIMIT 1", (day, str(round_cents(-total))))
+            if target:
+                S.cancel_sale(db, target["id"], user_id, f"сторно за касою, чек {rc['number']}")
+                st["refunds"] += 1
+            else:
+                st["refunds_unmatched"].append(f"чек {rc['number']} {day} {total} €")
+            # позначаємо сторно-чек як оброблений
+            with db.tx() as c:
+                c.execute("INSERT INTO sales(sold_at, sale_date, payment_method, status, total, cost_total, comment, created_by, created_at, client_key) "
+                          "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                          (rc["dt"].replace(tzinfo=TZ).isoformat(), day, rc["payment"], "cancelled", str(total), "0",
+                           f"сторно Octobox №{rc['number']}", user_id, now_iso(), key))
+            continue
+        lines = []
+        planned: dict[int, int] = {}   # грамів уже заплановано в цьому чеку по товару
+        for l in rc["lines"]:
+            if l["name"] not in cache:
+                cache[l["name"]] = S.match_product(db, l["name"])[0]
+            pid = cache[l["name"]]
+            if not pid:
+                st["unmatched"][l["name"]] = st["unmatched"].get(l["name"], 0) + 1
+                continue
+            prod = S.get_product(db, pid)
+            grams, pieces = l["grams"], None
+            if prod["sale_mode"] == "piece" or grams <= 0:
+                pg = prod["piece_grams"] or 0
+                if pg <= 0:
+                    st["unmatched"][l["name"] + " (немає ваги і не штучний)"] = 1
+                    continue
+                pieces = 1
+                grams = pg
+            price = (l["amount"] / pieces) if pieces else (l["amount"] * 1000 / Decimal(grams)).quantize(Decimal("0.0001"))
+            need = planned.get(pid, 0) + grams
+            have = S.stock_of_product(db, pid)
+            if have < need:
+                _add_batch(db, user_id, pid, need - have, _last_price(db, pid), day, f"продано за касою, залишку в боті не було (чек {rc['number']})")
+                st["shortfalls"].append(f"{prod['name']} +{need - have} г")
+            planned[pid] = need
+            lines.append(S.SaleLine(pid, grams, price, pieces))
+        if not lines:
+            if skip_unmatched:
+                continue
+            raise ValueError(f"Чек {rc['number']}: жоден товар не прив'язано")
+        S.create_sale(db, user_id, lines, rc["payment"], client_key=key, comment=f"Octobox чек №{rc['number']}",
+                      sold_at=rc["dt"].replace(tzinfo=TZ).isoformat())
+        st["created"] += 1
+    return st
+
+
+def now_iso() -> str:
+    from .db import now_utc
+    return now_utc()

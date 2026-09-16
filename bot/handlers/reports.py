@@ -16,7 +16,7 @@ from .. import services as S
 from ..cash_import import parse_cash_report
 from ..config import TZ, settings
 from ..export import build_csv_movements, build_excel
-from ..keyboards import CANCEL, M_REPORTS, M_SETTINGS, inline, main_menu, nav_kb
+from ..keyboards import CANCEL, M_REPORTS, M_SETTINGS, inline, main_menu, nav_kb, product_picker
 from ..money import fmt_grams, fmt_money
 from ..db import today_local, get_db
 from .common import Flow, has_role, parse_date, parse_period, ua_date
@@ -38,6 +38,10 @@ class Sett(StatesGroup):
     history_file = State()
     expenses_file = State()
     reset_confirm = State()
+    octobox_file = State()
+    octobox_review = State()
+    octobox_alias = State()
+    octobox_date = State()
 
 
 class Exp(StatesGroup):
@@ -334,7 +338,8 @@ def settings_kb(user):
                  [("💾 Резервна копія зараз", "set:backup"), ("♻️ Відновити з файлу", "set:restore")],
                  [("🧾 Імпорт звіту каси", "set:cashimport")],
                  [("📥 Імпорт товарів з файлу", "set:prodimport"), ("📥 Імпорт початкових залишків", "set:openimport")],
-                 [("📥 Імпорт історії руху товарів", "set:histimport"), ("📥 Імпорт витрат", "set:expimport")]]
+                 [("📥 Імпорт історії руху товарів", "set:histimport"), ("📥 Імпорт витрат", "set:expimport")],
+                 [("🧾 Імпорт чеків Octobox (по товарах)", "set:octobox")], [("🔗 Прив'язки назв каси", "set:aliases")]]
     return inline(rows)
 
 
@@ -550,6 +555,151 @@ async def exp_import_file(msg: Message, state: FSMContext, user):
     if errors:
         txt += "\n\n⚠️ Помилки:\n" + "\n".join(errors[:15])
     await msg.answer(txt, reply_markup=main_menu(user["role"]))
+
+
+# ---------------- Octobox: імпорт чеків по позиціях ----------------
+
+@router.callback_query(F.data == "set:octobox")
+async def octo_start(cb: CallbackQuery, state: FSMContext, user):
+    if user["role"] != "admin":
+        return await cb.answer("Лише адміністратор", show_alert=True)
+    await state.clear()
+    await state.set_state(Sett.octobox_file)
+    await cb.message.answer(
+        "🧾 Надішліть експорт Octobox <b>по позиціях</b> (Excel з колонками Produkt, Betrag, Gewicht (kg)). "
+        "Бот створить продажі по чеках і спише залишки. Чеки, що вже імпортовані, пропускаються.\n"
+        "⚠️ Спершу внесіть закупівлі за цей період — інакше бот дооприбуткує нестачу автоматично і позначить це.",
+        reply_markup=nav_kb(back=False))
+    await cb.answer()
+
+
+@router.message(StateFilter(Sett.octobox_file), F.document)
+async def octo_file(msg: Message, state: FSMContext, db, user):
+    import base64
+    from ..tools import parse_octobox_lines, octobox_summary, last_octobox_date
+    buf = io.BytesIO()
+    await msg.bot.download(msg.document, destination=buf)
+    try:
+        receipts = parse_octobox_lines(msg.document.file_name, buf.getvalue())
+    except Exception as e:
+        return await msg.answer(f"⚠️ {e}")
+    if not receipts:
+        return await msg.answer("⚠️ У файлі немає чеків.")
+    last = last_octobox_date(db) or db.one("SELECT MAX(sale_date) d FROM sales WHERE status='done'")["d"]
+    since = None
+    if last:
+        since = (dt.date.fromisoformat(last) + dt.timedelta(days=1)).isoformat()
+    await state.update_data(octo_b64=base64.b64encode(buf.getvalue()).decode(), octo_name=msg.document.file_name, octo_since=since)
+    await state.set_state(Sett.octobox_review)
+    await _octo_review(msg, state, db)
+
+
+async def _octo_review(msg: Message, state: FSMContext, db):
+    import base64
+    from ..tools import parse_octobox_lines, octobox_summary
+    data = await state.get_data()
+    receipts = parse_octobox_lines(data["octo_name"], base64.b64decode(data["octo_b64"]))
+    sm = octobox_summary(receipts)
+    lines = [f"🧾 Чеків: {sm['count']} · {ua_date(sm['date_from'])} — {ua_date(sm['date_to'])} · днів: {len(sm['days'])}",
+             "\n<b>Прив'язка назв каси до товарів бота</b> (натисніть, щоб змінити):"]
+    names = sorted(sm["matches"].items(), key=lambda kv: (kv[1]["how"] != "none", kv[1]["how"] != "auto", kv[0]))
+    unmatched = [n for n, m in names if m["how"] == "none"]
+    for n, m in names:
+        mark = {"none": "❌", "auto": "🔸", "exact": "✅", "alias": "🔗"}[m["how"]]
+        lines.append(f"{mark} {n} → {m['product_name'] or '<b>не знайдено</b>'} ({m['count']})")
+    lines.append("\n✅ точний збіг · 🔗 збережена прив'язка · 🔸 підібрано автоматично — перевірте · ❌ не знайдено (буде пропущено)")
+    await msg.answer("\n".join(lines))
+    kb = [[(f"✏️ {n[:36]}", f"octo:alias:{i}")] for i, (n, m) in enumerate(names)]
+    await state.update_data(octo_names=[n for n, _ in names])
+    since = data.get("octo_since")
+    kb.append([(f"▶️ Імпортувати з {ua_date(since)}" if since else "▶️ Імпортувати всі чеки", "octo:run:since")])
+    if since:
+        kb.append([("▶️ Імпортувати всі чеки з файлу", "octo:run:all")])
+    kb.append([("📆 Інша дата початку", "octo:date")])
+    await msg.answer("Дія:", reply_markup=inline(kb))
+
+
+@router.callback_query(StateFilter(Sett.octobox_review), F.data.startswith("octo:alias:"))
+async def octo_alias(cb: CallbackQuery, state: FSMContext, db):
+    data = await state.get_data()
+    name = data["octo_names"][int(cb.data.split(":")[2])]
+    await state.update_data(octo_alias_name=name)
+    await state.set_state(Sett.octobox_alias)
+    await cb.message.answer(f"Який товар бота відповідає «{name}»?", reply_markup=product_picker(db, "al", show_price=False))
+    await cb.answer()
+
+
+@router.callback_query(StateFilter(Sett.octobox_alias), F.data.startswith("pp:al:"))
+async def octo_alias_pick(cb: CallbackQuery, state: FSMContext, db, user):
+    parts = cb.data.split(":")
+    if parts[2] in ("cat", "pg"):
+        cat = parts[3] if parts[2] == "cat" else (parts[4] or None)
+        page = int(parts[3]) if parts[2] == "pg" else 0
+        await cb.message.edit_reply_markup(reply_markup=product_picker(db, "al", cat, page, show_price=False))
+        return await cb.answer()
+    data = await state.get_data()
+    S.set_alias(db, data["octo_alias_name"], int(parts[3]), user["telegram_id"])
+    await cb.answer("Прив'язано")
+    await state.set_state(Sett.octobox_review)
+    await _octo_review(cb.message, state, db)
+
+
+@router.callback_query(StateFilter(Sett.octobox_review), F.data == "octo:date")
+async def octo_date(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(Sett.octobox_date)
+    await cb.message.answer("З якої дати імпортувати чеки? (наприклад 01.09.2026)", reply_markup=nav_kb(back=False))
+    await cb.answer()
+
+
+@router.message(StateFilter(Sett.octobox_date), F.text)
+async def octo_date_text(msg: Message, state: FSMContext, db):
+    d_ = parse_date(msg.text)
+    if not d_:
+        return await msg.answer("⚠️ Дата як 01.09.2026")
+    await state.update_data(octo_since=d_)
+    await state.set_state(Sett.octobox_review)
+    await _octo_review(msg, state, db)
+
+
+@router.callback_query(StateFilter(Sett.octobox_review), F.data.startswith("octo:run:"))
+async def octo_run(cb: CallbackQuery, state: FSMContext, db, user):
+    import base64
+    from ..tools import parse_octobox_lines, import_octobox
+    data = await state.get_data()
+    since = data.get("octo_since") if cb.data.endswith(":since") else None
+    await cb.answer()
+    await cb.message.answer("⏳ Імпортую чеки…")
+    receipts = parse_octobox_lines(data["octo_name"], base64.b64decode(data["octo_b64"]))
+    try:
+        st = import_octobox(receipts, user["telegram_id"], since=since)
+    except Exception as e:
+        return await cb.message.answer(f"⚠️ Помилка імпорту: {e}")
+    await state.clear()
+    txt = [f"✅ Створено продажів: {st['created']}", f"Пропущено як уже імпортовані: {st['skipped_dup']}"]
+    if st["skipped_old"]:
+        txt.append(f"Пропущено як старіші за дату початку: {st['skipped_old']}")
+    if st["refunds"]:
+        txt.append(f"Сторно опрацьовано: {st['refunds']}")
+    if st["refunds_unmatched"]:
+        txt.append("⚠️ Сторно без пари (перевірте вручну): " + "; ".join(st["refunds_unmatched"][:10]))
+    if st["unmatched"]:
+        txt.append("⚠️ Пропущено позиції без прив'язки: " + ", ".join(f"{k} ({v})" for k, v in st["unmatched"].items()))
+    if st["shortfalls"]:
+        from collections import Counter
+        c = Counter(x.split(" +")[0] for x in st["shortfalls"])
+        txt.append("⚠️ Продано більше, ніж було в залишку — нестачу дооприбутковано автоматично (внесіть закупівлі й перевірте партії): "
+                   + ", ".join(f"{k} ({v} поз.)" for k, v in c.items()))
+    await cb.message.answer("\n".join(txt), reply_markup=main_menu(user["role"]))
+
+
+@router.callback_query(F.data == "set:aliases")
+async def aliases_list(cb: CallbackQuery, db):
+    rows = S.list_aliases(db)
+    if not rows:
+        await cb.message.answer("Збережених прив'язок ще немає — вони з'являються, коли ви вручну зіставляєте назви під час імпорту чеків.")
+    else:
+        await cb.message.answer("🔗 <b>Назви каси → товари бота</b>\n" + "\n".join(f"• {r['alias_raw']} → {r['product_name']}" for r in rows))
+    await cb.answer()
 
 
 @router.callback_query(F.data == "set:cashimport")

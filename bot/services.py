@@ -384,7 +384,7 @@ def create_sale(db: Database, user_id: int, lines: list[SaleLine], payment_metho
     """sold_at — лише для імпорту історії (ISO-дата 'YYYY-MM-DD'); інакше — зараз."""
     if not lines:
         raise ValueError("Продаж без позицій")
-    ts = f"{sold_at}T12:00:00+00:00" if sold_at else now_utc()
+    ts = (f"{sold_at}T12:00:00+00:00" if len(sold_at) == 10 else sold_at) if sold_at else now_utc()
     with db.tx() as c:
         if client_key:
             dup = c.execute("SELECT id, total, cost_total FROM sales WHERE client_key=?", (client_key,)).fetchone()
@@ -526,6 +526,73 @@ def reset_all_data(db: Database, user_id: int) -> None:
             c.execute(f"DELETE FROM {t}")
         c.execute("DELETE FROM sqlite_sequence")
         audit(c, user_id, "db.reset", None)
+
+
+# ======================= прив'язки назв каси =======================
+
+import re as _re
+import difflib as _difflib
+
+_STOP = {"di", "con", "del", "della", "de", "dop", "igp", "ca", "g", "gr", "kg", "la", "il", "frische", "pasta",
+         "einzel", "ohne", "kopf", "dissosato", "nostrana", "classico", "piccante", "stagionato", "dolche", "dolce"}
+
+
+def norm_name(s: str) -> str:
+    return _re.sub(r"\s+", " ", (s or "").strip().lower())
+
+
+def _tokens(s: str) -> list[str]:
+    toks = _re.findall(r"[a-zà-ÿäöüß]+", norm_name(s))
+    return [t for t in toks if t not in _STOP and len(t) > 2]
+
+
+def get_alias(db: Database, raw: str):
+    r = db.one("SELECT product_id FROM product_aliases WHERE alias=?", (norm_name(raw),))
+    return r["product_id"] if r else None
+
+
+def set_alias(db: Database, raw: str, product_id: int, user_id: int) -> None:
+    with db.tx() as c:
+        c.execute("INSERT INTO product_aliases(alias, alias_raw, product_id, created_by, created_at) VALUES (?,?,?,?,?) "
+                  "ON CONFLICT(alias) DO UPDATE SET product_id=excluded.product_id, alias_raw=excluded.alias_raw",
+                  (norm_name(raw), raw.strip(), product_id, user_id, now_utc()))
+
+
+def list_aliases(db: Database):
+    return db.q("SELECT a.*, p.name AS product_name FROM product_aliases a JOIN products p ON p.id=a.product_id ORDER BY a.alias_raw")
+
+
+def match_product(db: Database, raw: str) -> tuple[int | None, str]:
+    """-> (product_id | None, спосіб: 'alias' | 'exact' | 'auto' | 'none')."""
+    pid = get_alias(db, raw)
+    if pid:
+        return pid, "alias"
+    n = norm_name(raw)
+    row = db.one("SELECT id FROM products WHERE lower(trim(name))=?", (n,))
+    if row:
+        return row["id"], "exact"
+    rt = _tokens(raw)
+    if not rt:
+        return None, "none"
+    best: list[tuple[float, int, int, str]] = []
+    for p in db.q("SELECT p.id, p.name, COALESCE((SELECT SUM(grams_left) FROM batches b WHERE b.product_id=p.id),0) AS st "
+                  "FROM products p WHERE p.active=1"):
+        pt = _tokens(p["name"])
+        if not pt:
+            continue
+        hit = 0
+        for t in rt:
+            if any(_difflib.SequenceMatcher(None, t, q).ratio() >= 0.8 for q in pt):
+                hit += 1
+        score = hit / len(rt)
+        if score >= 0.5:
+            best.append((score, 1 if p["st"] > 0 else 0, -len(p["name"]), p["name"], p["id"]))
+    if not best:
+        return None, "none"
+    best.sort(reverse=True)
+    if len(best) > 1 and best[0][0] == best[1][0] and best[0][1] == best[1][1] and best[0][0] < 1.0:
+        return None, "none"   # неоднозначно — хай вирішує людина
+    return best[0][4], "auto"
 
 
 # ======================= витрати =======================

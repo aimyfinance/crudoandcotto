@@ -72,7 +72,10 @@ async def main() -> None:
                                BotCommand(command="backup", description="Резервна копія (адмін)")])
     await web_server()
     if settings.webapp_url:
-        await bot.set_chat_menu_button(menu_button=MenuButtonWebApp(text="Каса", web_app=WebAppInfo(url=settings.webapp_url + "/app")))
+        try:
+            await bot.set_chat_menu_button(menu_button=MenuButtonWebApp(text="Каса", web_app=WebAppInfo(url=settings.webapp_url + "/app")))
+        except Exception as e:  # некоректний WEBAPP_URL не має зупиняти бота
+            log.warning("не вдалося встановити кнопку меню Mini App (%s): %s", settings.webapp_url, e)
     asyncio.create_task(daily_backup(bot))
     log.info("bot started, db=%s", settings.db_path)
     await bot.delete_webhook(drop_pending_updates=False)

@@ -33,6 +33,10 @@ class Settings:
     company_name: str = os.getenv("COMPANY_NAME", "Crudo & Cotto Delikatessen")
     webapp_url: str = os.getenv("WEBAPP_URL", "").strip().rstrip("/")   # публічна https-адреса сервера для Mini App
 
+    def __post_init__(self):
+        if self.webapp_url and not self.webapp_url.startswith("http"):
+            self.webapp_url = "https://" + self.webapp_url
+
     def validate(self) -> None:
         if not self.bot_token:
             raise SystemExit("BOT_TOKEN не задано (див. .env.example)")
