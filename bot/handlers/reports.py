@@ -309,13 +309,137 @@ async def exp_add_msg(msg: Message, state: FSMContext, user):
     await eflow.goto(msg, state, Exp.date, push=False)
 
 
+def expense_card(e) -> str:
+    docs = len(get_db().q("SELECT id FROM documents WHERE kind='expense' AND ref_id=?", (e["id"],)))
+    return (f"💸 <b>Витрата №{e['id']}</b>" + (" · <i>скасована</i>" if e["status"] == "cancelled" else "") +
+            f"\n{ua_date(e['op_date'])} · {S.EXP_TYPES[e['exp_type']]}\n<b>{e['category']}</b> — <b>{fmt_money(e['amount'])}</b>"
+            + (f"\nКоментар: {e['comment']}" if e["comment"] else "") +
+            f"\nВніс(ла): {e['user_name'] or e['created_by']}" + (f" · 📎 документів: {docs}" if docs else ""))
+
+
+def expense_card_kb(e):
+    if e["status"] == "cancelled":
+        return inline([[("↩️ Відновити", f"exp:restore:{e['id']}")]])
+    return inline([[("🔁 Повторити сьогодні", f"exp:repeat:{e['id']}"), ("✏️ Змінити", f"exp:edit:{e['id']}")],
+                   [("🗑 Видалити", f"exp:delask:{e['id']}")]])
+
+
 @router.message(StateFilter(None), F.text == M_EXP_LIST)
 async def exp_list_msg(msg: Message, db, user):
-    rows = S.recent_expenses(db, 10)
+    rows = S.recent_expenses(db, 12)
     if not rows:
         return await msg.answer("Витрат ще немає.")
-    await msg.answer("💸 <b>Останні витрати</b> (натисніть, щоб видалити помилкову):", reply_markup=inline(
-        [[(f"{ua_date(r['op_date'])} {r['category'][:22]} {fmt_money(r['amount'])}", f"exp:del:{r['id']}")] for r in rows]))
+    kb = [[(f"{ua_date(r['op_date'])} {r['category'][:22]} {fmt_money(r['amount'])}", f"exp:view:{r['id']}")] for r in rows]
+    if S.recent_cancelled_expenses(db, 1):
+        kb.append([("↩️ Скасовані (відновити)", "exp:cancelled")])
+    await msg.answer("💸 <b>Останні витрати</b> — натисніть, щоб відкрити:", reply_markup=inline(kb))
+
+
+@router.callback_query(F.data.startswith("exp:view:"))
+async def exp_view(cb: CallbackQuery, db, user):
+    e = S.get_expense(db, int(cb.data.split(":")[2]))
+    if not e:
+        return await cb.answer("Не знайдено", show_alert=True)
+    await cb.message.answer(expense_card(e), reply_markup=expense_card_kb(e) if has_role(user, "manager") else None)
+    await cb.answer()
+
+
+@router.callback_query(F.data == "exp:cancelled")
+async def exp_cancelled(cb: CallbackQuery, db):
+    rows = S.recent_cancelled_expenses(db, 10)
+    await cb.message.answer("Скасовані витрати — натисніть, щоб відновити:", reply_markup=inline(
+        [[(f"{ua_date(r['op_date'])} {r['category'][:22]} {fmt_money(r['amount'])}", f"exp:restore:{r['id']}")] for r in rows]))
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("exp:restore:"))
+async def exp_restore(cb: CallbackQuery, db, user):
+    if not has_role(user, "manager"):
+        return await cb.answer("Недостатньо прав", show_alert=True)
+    eid = int(cb.data.split(":")[2])
+    S.restore_expense(db, eid, user["telegram_id"])
+    await cb.answer("Відновлено", show_alert=True)
+    await cb.message.answer(expense_card(S.get_expense(db, eid)), reply_markup=expense_card_kb(S.get_expense(db, eid)))
+
+
+@router.callback_query(F.data.startswith("exp:repeat:"))
+async def exp_repeat(cb: CallbackQuery, db, user):
+    if not has_role(user, "manager"):
+        return await cb.answer("Недостатньо прав", show_alert=True)
+    e = S.get_expense(db, int(cb.data.split(":")[2]))
+    nid = S.add_expense(db, user["telegram_id"], today_local(), e["exp_type"], e["category"], Decimal(e["amount"]), e["comment"])
+    await cb.answer("Створено копію на сьогодні")
+    await cb.message.answer(expense_card(S.get_expense(db, nid)), reply_markup=expense_card_kb(S.get_expense(db, nid)))
+
+
+@router.callback_query(F.data.startswith("exp:delask:"))
+async def exp_delask(cb: CallbackQuery, db, user):
+    eid = int(cb.data.split(":")[2])
+    e = S.get_expense(db, eid)
+    await cb.message.answer(f"Точно видалити витрату №{eid} «{e['category']}» {fmt_money(e['amount'])}? Прикріплені чеки теж буде видалено.",
+                            reply_markup=inline([[("🗑 Так, видалити", f"exp:del:{eid}"), ("Ні", "noop")]]))
+    await cb.answer()
+
+
+class ExpEdit(StatesGroup):
+    value = State()
+
+
+@router.callback_query(F.data.startswith("exp:edit:"))
+async def exp_edit(cb: CallbackQuery, state: FSMContext, db, user):
+    if not has_role(user, "manager"):
+        return await cb.answer("Недостатньо прав", show_alert=True)
+    parts = cb.data.split(":")
+    eid = int(parts[2])
+    if len(parts) == 3:
+        await cb.message.answer("Що змінити?", reply_markup=inline([
+            [("💶 Суму", f"exp:edit:{eid}:amount"), ("🏷 Категорію", f"exp:edit:{eid}:category")],
+            [("📅 Дату", f"exp:edit:{eid}:op_date"), ("💬 Коментар", f"exp:edit:{eid}:comment")],
+            [("📂 Тип", f"exp:edit:{eid}:exp_type")]]))
+        return await cb.answer()
+    field = parts[3]
+    if field == "exp_type":
+        await cb.message.answer("Тип:", reply_markup=inline([[(v, f"exp:settype:{eid}:{k}")] for k, v in S.EXP_TYPES.items()]))
+        return await cb.answer()
+    await state.set_state(ExpEdit.value)
+    await state.update_data(exp_edit_id=eid, exp_edit_field=field)
+    prompts = {"amount": "Нова сума, €:", "category": "Нова категорія:", "op_date": "Нова дата (15.09.2026):", "comment": "Новий коментар:"}
+    await cb.message.answer(prompts[field], reply_markup=nav_kb(back=False))
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("exp:settype:"))
+async def exp_settype(cb: CallbackQuery, db, user):
+    _, _, eid, t = cb.data.split(":")
+    S.update_expense(db, int(eid), user["telegram_id"], exp_type=t)
+    await cb.answer("Змінено")
+    e = S.get_expense(db, int(eid))
+    await cb.message.answer(expense_card(e), reply_markup=expense_card_kb(e))
+
+
+@router.message(StateFilter(ExpEdit.value), F.text)
+async def exp_edit_value(msg: Message, state: FSMContext, db, user):
+    from ..money import parse_money, ParseError
+    data = await state.get_data()
+    eid, field = data["exp_edit_id"], data["exp_edit_field"]
+    try:
+        if field == "amount":
+            S.update_expense(db, eid, user["telegram_id"], amount=parse_money(msg.text))
+        elif field == "op_date":
+            d_ = parse_date(msg.text)
+            if not d_:
+                return await msg.answer("⚠️ Дата як 15.09.2026")
+            S.update_expense(db, eid, user["telegram_id"], op_date=d_)
+        elif field == "category":
+            S.update_expense(db, eid, user["telegram_id"], category=msg.text.strip()[:60])
+        else:
+            S.update_expense(db, eid, user["telegram_id"], comment=msg.text.strip()[:120])
+    except ParseError as e:
+        return await msg.answer(f"⚠️ {e}")
+    await state.clear()
+    e = S.get_expense(db, eid)
+    await msg.answer("✅ Змінено.\n" + expense_card(e), reply_markup=expense_card_kb(e))
+    await msg.answer("Готово.", reply_markup=main_menu(user["role"]))
 
 
 @router.message(StateFilter(None), F.text.in_({M_DOCS_PURCH, M_DOCS_EXP}))
@@ -537,8 +661,8 @@ async def exp_list(cb: CallbackQuery, db, user):
     if not rows:
         await cb.message.answer("Витрат ще немає.")
     else:
-        await cb.message.answer("Останні витрати (натисніть, щоб видалити помилкову):", reply_markup=inline(
-            [[(f"{ua_date(r['op_date'])} {r['category'][:22]} {fmt_money(r['amount'])}", f"exp:del:{r['id']}")] for r in rows]))
+        await cb.message.answer("Останні витрати — натисніть, щоб відкрити:", reply_markup=inline(
+            [[(f"{ua_date(r['op_date'])} {r['category'][:22]} {fmt_money(r['amount'])}", f"exp:view:{r['id']}")] for r in rows]))
     await cb.answer()
 
 

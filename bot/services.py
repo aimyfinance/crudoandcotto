@@ -655,6 +655,34 @@ def cancel_expense(db: Database, expense_id: int, user_id: int) -> int:
     return delete_documents_for(db, "expense", expense_id)
 
 
+def restore_expense(db: Database, expense_id: int, user_id: int) -> None:
+    with db.tx() as c:
+        c.execute("UPDATE expenses SET status='done' WHERE id=?", (expense_id,))
+        audit(c, user_id, "expense.restore", {"expense_id": expense_id})
+
+
+def update_expense(db: Database, expense_id: int, user_id: int, **fields) -> None:
+    allowed = {"op_date", "exp_type", "category", "amount", "comment"}
+    sets, vals = [], []
+    for k, v in fields.items():
+        if k not in allowed:
+            raise ValueError(k)
+        sets.append(f"{k}=?")
+        vals.append(str(round_cents(v)) if k == "amount" else v)
+    vals.append(expense_id)
+    with db.tx() as c:
+        c.execute(f"UPDATE expenses SET {', '.join(sets)} WHERE id=?", vals)
+        audit(c, user_id, "expense.update", {"expense_id": expense_id, "fields": list(fields)})
+
+
+def get_expense(db: Database, expense_id: int):
+    return db.one("SELECT e.*, u.name AS user_name FROM expenses e LEFT JOIN users u ON u.telegram_id=e.created_by WHERE e.id=?", (expense_id,))
+
+
+def recent_cancelled_expenses(db: Database, limit: int = 10):
+    return db.q("SELECT * FROM expenses WHERE status='cancelled' ORDER BY id DESC LIMIT ?", (limit,))
+
+
 def expense_categories(db: Database, exp_type: str | None = None) -> list[str]:
     sql = "SELECT category, COUNT(*) n FROM expenses WHERE status='done'"
     p: list = []
