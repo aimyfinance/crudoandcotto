@@ -604,10 +604,35 @@ async def set_users(cb: CallbackQuery, db, user):
         f"• {u['name'] or '—'} — {S.ROLES[u['role']]} (<code>{u['telegram_id']}</code>){'' if u['active'] else ' · вимкнено'}" for u in rows)
     kb = None
     if user["role"] == "admin":
-        kb = inline([[(f"🚫 {u['name'] or u['telegram_id']}", f"set:deluser:{u['telegram_id']}")]
+        kb = inline([[(f"🔄 Роль: {u['name'] or u['telegram_id']}", f"set:role:{u['telegram_id']}"),
+                      (f"🚫", f"set:deluser:{u['telegram_id']}")]
                      for u in rows if u["active"] and u["telegram_id"] != user["telegram_id"]])
-    await cb.message.answer(txt + ("\n\nВимкнути доступ:" if kb and kb.inline_keyboard else ""), reply_markup=kb if kb and kb.inline_keyboard else None)
+    await cb.message.answer(txt + ("\n\n🔄 змінити роль · 🚫 вимкнути доступ:" if kb and kb.inline_keyboard else ""), reply_markup=kb if kb and kb.inline_keyboard else None)
     await cb.answer()
+
+
+@router.callback_query(F.data.startswith("set:role:"))
+async def set_role_pick(cb: CallbackQuery, db, user):
+    if user["role"] != "admin":
+        return await cb.answer("Лише адміністратор", show_alert=True)
+    tid = int(cb.data.split(":")[2])
+    u = db.one("SELECT * FROM users WHERE telegram_id=?", (tid,))
+    await cb.message.answer(f"Нова роль для {u['name'] or tid} (зараз {S.ROLES[u['role']]}):",
+                            reply_markup=inline([[(v, f"set:setrole:{tid}:{k}")] for k, v in S.ROLES.items() if k != u["role"]]))
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("set:setrole:"))
+async def set_role_apply(cb: CallbackQuery, db, user):
+    if user["role"] != "admin":
+        return await cb.answer("Лише адміністратор", show_alert=True)
+    _, _, tid, role = cb.data.split(":")
+    S.upsert_user(db, int(tid), role)
+    await cb.answer(f"Роль змінено на {S.ROLES[role]}", show_alert=True)
+    try:
+        await cb.bot.send_message(int(tid), f"ℹ️ Вашу роль у боті змінено на «{S.ROLES[role]}». Натисніть /start, щоб оновити меню.")
+    except Exception:
+        pass
 
 
 @router.callback_query(F.data.startswith("set:deluser:"))

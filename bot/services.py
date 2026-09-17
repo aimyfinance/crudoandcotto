@@ -1011,6 +1011,28 @@ def get_document(db: Database, doc_id: int):
     return db.one("SELECT * FROM documents WHERE id=?", (doc_id,))
 
 
-def notify_targets(db: Database, min_role: str = "manager") -> list[int]:
+def notify_targets(db: Database, min_role: str = "manager", actor_id: int | None = None) -> list[int]:
+    """Кого сповіщати. Про дії адміністратора дізнаються лише інші адміни."""
     roles = ("admin", "manager") if min_role == "manager" else ("admin",)
+    if actor_id is not None:
+        actor = get_user(db, actor_id)
+        if actor and actor["role"] == "admin":
+            roles = ("admin",)
     return [r["telegram_id"] for r in db.q(f"SELECT telegram_id FROM users WHERE active=1 AND role IN ({','.join('?' * len(roles))})", roles)]
+
+
+def visible_sales(db: Database, user, limit: int = 15, date: str | None = None):
+    """Продавець бачить лише свої продажі; менеджер — усі, крім адмінських; адмін — усі."""
+    sql = "SELECT s.* FROM sales s LEFT JOIN users u ON u.telegram_id=s.created_by WHERE 1=1"
+    p: list = []
+    if user["role"] == "seller":
+        sql += " AND s.created_by=?"
+        p.append(user["telegram_id"])
+    elif user["role"] == "manager":
+        sql += " AND COALESCE(u.role,'') <> 'admin'"
+    if date:
+        sql += " AND s.sale_date=?"
+        p.append(date)
+    sql += " ORDER BY s.id DESC LIMIT ?"
+    p.append(limit)
+    return db.q(sql, p)

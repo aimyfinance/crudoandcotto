@@ -217,7 +217,7 @@ async def shift_close_cash(msg: Message, state: FSMContext, db, user):
 
 
 async def _notify(bot: Bot, db, text: str, exclude: int | None = None) -> None:
-    for uid in S.notify_targets(db, "manager"):
+    for uid in S.notify_targets(db, "manager", actor_id=exclude):
         if uid == exclude:
             continue
         try:
@@ -312,12 +312,80 @@ def save_document(db, user_id: int, kind: str, ref_id: int | None, file_name: st
     return S.add_document(db, user_id, kind, ref_id, file_name, str(path))
 
 
+class Attach(StatesGroup):
+    kind = State()
+    target = State()
+    file = State()
+
+
 @router.callback_query(F.data == "set:docs")
 async def docs_menu(cb: CallbackQuery, user):
     if not has_role(user, "manager"):
         return await cb.answer("Недостатньо прав", show_alert=True)
-    await cb.message.answer("📁 <b>Документи</b>", reply_markup=inline([[("📦 Інвойси закупівель", "docs:purchase"), ("💸 Чеки витрат", "docs:expense")]]))
+    await cb.message.answer("📁 <b>Документи</b>", reply_markup=inline([[("📦 Інвойси закупівель", "docs:purchase"), ("💸 Чеки витрат", "docs:expense")],
+                                                                      [("🗃 Інше", "docs:other")],
+                                                                      [("➕ Прикріпити документ", "docs:attach")]]))
     await cb.answer()
+
+
+@router.callback_query(F.data == "docs:attach")
+async def attach_start(cb: CallbackQuery, state: FSMContext, user):
+    if not has_role(user, "manager"):
+        return await cb.answer("Недостатньо прав", show_alert=True)
+    await state.clear()
+    await state.set_state(Attach.kind)
+    await cb.message.answer("До чого прикріпити?", reply_markup=nav_kb(back=False))
+    await cb.message.answer("Оберіть:", reply_markup=inline([[("📦 До закупівлі", "att:kind:purchase"), ("💸 До витрати", "att:kind:expense")],
+                                                             [("🗃 Просто в архів", "att:kind:other")]]))
+    await cb.answer()
+
+
+@router.callback_query(StateFilter(Attach.kind), F.data.startswith("att:kind:"))
+async def attach_kind(cb: CallbackQuery, state: FSMContext, db):
+    kind = cb.data.split(":")[2]
+    await state.update_data(att_kind=kind)
+    if kind == "other":
+        await state.update_data(att_ref=None)
+        await state.set_state(Attach.file)
+        await cb.message.answer("📎 Надішліть файл або фото:")
+        return await cb.answer()
+    if kind == "purchase":
+        rows = S.recent_purchases(db, 15)
+        kb = [[(f"№{r['id']} {ua_date(r['doc_date'])} {r['supplier_name'] or ''} {(r['comment'] or '')[:20]}", f"att:ref:{r['id']}")] for r in rows]
+    else:
+        rows = S.recent_expenses(db, 15)
+        kb = [[(f"№{r['id']} {ua_date(r['op_date'])} {r['category'][:22]} {fmt_money(r['amount'])}", f"att:ref:{r['id']}")] for r in rows]
+    if not kb:
+        await state.clear()
+        await cb.message.answer("Записів ще немає.")
+        return await cb.answer()
+    await state.set_state(Attach.target)
+    await cb.message.answer("До якого запису?", reply_markup=inline(kb))
+    await cb.answer()
+
+
+@router.callback_query(StateFilter(Attach.target), F.data.startswith("att:ref:"))
+async def attach_target(cb: CallbackQuery, state: FSMContext):
+    await state.update_data(att_ref=int(cb.data.split(":")[2]))
+    await state.set_state(Attach.file)
+    await cb.message.answer("📎 Надішліть файл або фото (можна кілька по черзі; «❌ Скасувати» — коли все):")
+    await cb.answer()
+
+
+@router.message(StateFilter(Attach.file), F.document | F.photo)
+async def attach_file(msg: Message, state: FSMContext, db, user):
+    import io
+    data = await state.get_data()
+    buf = io.BytesIO()
+    if msg.document:
+        await msg.bot.download(msg.document, destination=buf)
+        name = msg.document.file_name or "document"
+    else:
+        await msg.bot.download(msg.photo[-1], destination=buf)
+        name = f"photo_{dt.datetime.now(TZ):%H%M%S}.jpg"
+    save_document(db, user["telegram_id"], data["att_kind"], data.get("att_ref"), name, buf.getvalue())
+    ref = f" до запису №{data['att_ref']}" if data.get("att_ref") else " в архів"
+    await msg.answer(f"📁 Збережено{ref}. Надішліть ще один файл або натисніть «❌ Скасувати».")
 
 
 @router.callback_query(F.data.startswith("docs:"))
@@ -332,7 +400,7 @@ async def docs_list(cb: CallbackQuery, db, user):
         return await cb.answer()
     rows = S.list_documents(db, parts[1])
     if not rows:
-        await cb.message.answer("Документів ще немає.")
+        await cb.message.answer("Документів ще немає. Прикріпити: 📁 Документи → ➕ Прикріпити документ.")
     else:
         await cb.message.answer("Останні документи (натисніть, щоб отримати файл):", reply_markup=inline(
             [[(f"№{d['ref_id'] or '—'} · {local_dt_str(d['uploaded_at'])[:10]} · {d['file_name'][:24]}", f"docs:get:{d['id']}")] for d in rows]))

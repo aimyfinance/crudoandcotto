@@ -332,8 +332,8 @@ def sale_line_text(s) -> str:
 @router.message(F.text == M_HISTORY)
 async def history(msg: Message, db, user, state: FSMContext):
     await state.clear()
-    sales = S.recent_sales(db, 15)
-    txt = "🕘 <b>Останні продажі</b>\n" + ("\n".join(sale_line_text(s) for s in sales) if sales else "— немає")
+    sales = S.visible_sales(db, user, 15)
+    txt = "🕘 <b>Останні продажі</b>" + (" (ваші)" if user["role"] == "seller" else "") + "\n" + ("\n".join(sale_line_text(s) for s in sales) if sales else "— немає")
     if has_role(user, "manager"):
         wos = S.recent_writeoffs(db, 5)
         if wos:

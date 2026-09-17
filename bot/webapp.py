@@ -91,11 +91,12 @@ def _products_with_stock(db):
     return out
 
 
-def _today(db):
+def _today(db, user=None):
     t = today_local()
     rep = S.report_period(db, t, t)
+    src = S.visible_sales(db, user, 30, date=t) if user else S.recent_sales(db, 30, date=t)
     sales = [{"id": s["id"], "time": local_dt_str(s["sold_at"])[-5:], "total": str(d(s["total"])),
-              "payment": s["payment_method"], "status": s["status"]} for s in S.recent_sales(db, 30, date=t)]
+              "payment": s["payment_method"], "status": s["status"]} for s in src]
     sh = S.current_shift(db)
     return {
         "shift": {"open": bool(sh), "opened_at": local_dt_str(sh["opened_at"])[-5:] if sh else None, "by": sh["opened_name"] if sh else None},
@@ -113,7 +114,7 @@ def _today(db):
 async def bootstrap(body, user):
     db = get_db()
     return {"user": {"id": user["telegram_id"], "name": user["name"], "role": user["role"]},
-            "company": settings.company_name, "products": _products_with_stock(db), "today": _today(db),
+            "company": settings.company_name, "products": _products_with_stock(db), "today": _today(db, user),
             "client_key": uuid.uuid4().hex}
 
 
@@ -131,8 +132,8 @@ async def create_sale(body, user):
     try:
         res = S.create_sale(db, user["telegram_id"], lines, payment, client_key=f"app:{key}" if key else None)
     except S.DuplicateOperation as e:
-        return {"duplicate": True, "message": str(e), "today": _today(db), "products": _products_with_stock(db)}
-    return {"sale_id": res.sale_id, "total": str(res.total), "today": _today(db), "products": _products_with_stock(db),
+        return {"duplicate": True, "message": str(e), "today": _today(db, user), "products": _products_with_stock(db)}
+    return {"sale_id": res.sale_id, "total": str(res.total), "today": _today(db, user), "products": _products_with_stock(db),
             "client_key": uuid.uuid4().hex}
 
 
@@ -146,7 +147,7 @@ async def cancel_sale(body, user):
     if user["role"] == "seller" and (s["created_by"] != user["telegram_id"] or s["sale_date"] != today_local()):
         raise ValueError("Продавець може скасувати лише свій сьогоднішній продаж")
     S.cancel_sale(db, sid, user["telegram_id"], body.get("reason") or "скасовано в застосунку")
-    return {"ok": True, "today": _today(db), "products": _products_with_stock(db)}
+    return {"ok": True, "today": _today(db, user), "products": _products_with_stock(db)}
 
 
 @api
@@ -224,13 +225,13 @@ async def shift_toggle(body, user):
     if msg:
         bot = request_bot.get("bot")
         if bot:
-            for uid in S.notify_targets(db, "manager"):
+            for uid in S.notify_targets(db, "manager", actor_id=user["telegram_id"]):
                 if uid != user["telegram_id"]:
                     try:
                         await bot.send_message(uid, msg)
                     except Exception:
                         pass
-    return {"today": _today(db)}
+    return {"today": _today(db, user)}
 
 
 request_bot: dict = {}   # головний модуль кладе сюди екземпляр Bot для сповіщень
