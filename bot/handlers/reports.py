@@ -549,6 +549,13 @@ async def rep_cb(cb: CallbackQuery, state: FSMContext, db, user):
             await cb.message.answer("\n".join(txt))
         await cb.answer()
     elif code == "rec":
+        from .octobox import refresh_register_days, _client
+        if _client():
+            await cb.answer("Запитую касу…")
+            try:
+                await refresh_register_days(user["telegram_id"], d1, d2)
+            except Exception as e:
+                await cb.message.answer(f"⚠️ Не вдалося отримати дані каси онлайн: {e}. Показую те, що є з файлів.")
         rows = S.reconcile(db, d1, d2)
         if not rows:
             await cb.message.answer("За період немає ні продажів, ні даних каси.")
@@ -556,12 +563,17 @@ async def rep_cb(cb: CallbackQuery, state: FSMContext, db, user):
             txt = ["🧾 <b>Звірка бот ↔ каса</b>"]
             for r in rows:
                 if r["reg_total"] is None:
-                    txt.append(f"{ua_date(r['day'])}: бот {fmt_money(r['bot_total'])} · каса — не імпортовано")
+                    txt.append(f"{ua_date(r['day'])[:5]}  бот {fmt_money(r['bot_total']):>11}  каса —")
                 else:
                     flag = "✅" if r["diff"] == 0 else "⚠️"
-                    txt.append(f"{ua_date(r['day'])}: бот {fmt_money(r['bot_total'])} · каса {fmt_money(r['reg_total'])} · різниця {fmt_money(r['diff'])} {flag}")
-            await cb.message.answer("\n".join(txt))
-        await cb.answer()
+                    txt.append(f"{ua_date(r['day'])[:5]}  бот {fmt_money(r['bot_total']):>11}  каса {fmt_money(r['reg_total']):>11}  {fmt_money(r['diff']):>9} {flag}")
+            tot_b = sum((r["bot_total"] for r in rows), Decimal(0)); tot_r = sum((r["reg_total"] or Decimal(0) for r in rows), Decimal(0))
+            txt.append(f"Разом  бот {fmt_money(tot_b):>11}  каса {fmt_money(tot_r):>11}  {fmt_money(tot_b - tot_r):>9}")
+            await cb.message.answer(txt[0] + "\n<pre>" + "\n".join(txt[1:]) + "</pre>\n<i>Каса — з бек-офісу Octobox (онлайн) або з імпортованої виписки.</i>")
+        try:
+            await cb.answer()
+        except Exception:
+            pass
 
 
 # ---------------- витрати: ручне введення ----------------

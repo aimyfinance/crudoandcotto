@@ -342,3 +342,18 @@ def config() -> dict:
         "minutes": int(os.getenv("OCTOBOX_SYNC_MINUTES", "0") or 0), "pos_config": os.getenv("OCTOBOX_POS_CONFIG", "").strip() or None,
         "weight_field": os.getenv("OCTOBOX_WEIGHT_FIELD", "").strip() or None,
     }
+
+
+async def fetch_day_totals(client: OdooClient, date_from: str, date_to: str, pos_config: str | None, tz) -> dict[str, dict]:
+    """Підсумки каси по днях (Відень): {day: {"cash": Decimal, "card": Decimal}} — для звірки."""
+    since = dt.datetime.fromisoformat(date_from).replace(tzinfo=tz)
+    receipts = await fetch_receipts(client, since - dt.timedelta(days=1), None, pos_config, tz)
+    out: dict[str, dict] = {}
+    for r in receipts:
+        day = r["dt"].date().isoformat()
+        if not (date_from <= day <= date_to):
+            continue
+        e = out.setdefault(day, {"cash": Decimal(0), "card": Decimal(0)})
+        total = sum((l["amount"] for l in r["lines"]), Decimal(0))
+        e["card" if r["payment"] == "card" else "cash"] += total
+    return out

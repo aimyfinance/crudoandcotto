@@ -127,3 +127,19 @@ async def sync_loop(bot: Bot) -> None:
             log.exception("octobox sync failed")
         import asyncio
         await asyncio.sleep(minutes * 60)
+
+
+async def refresh_register_days(user_id: int, date_from: str, date_to: str) -> int:
+    """Підтягує підсумки каси по днях з бек-офісу у cash_register_days (джерело octobox-api). -> кількість днів."""
+    from ..octobox_api import fetch_day_totals
+    cl = _client()
+    if not cl:
+        return 0
+    cfg = config()
+    async with cl as c:
+        await c.authenticate()
+        days = await fetch_day_totals(c, date_from, date_to, cfg["pos_config"], TZ)
+    db = get_db()
+    for day, v in days.items():
+        S.save_cash_day(db, user_id, day, v["cash"], v["card"], "octobox-api")
+    return len(days)
