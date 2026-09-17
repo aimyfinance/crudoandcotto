@@ -8,6 +8,8 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import ErrorEvent
+from .fsm_storage import SQLiteStorage
 from aiogram.types import BotCommand, FSInputFile, MenuButtonWebApp, WebAppInfo
 
 from . import services as S
@@ -18,8 +20,27 @@ from .handlers import adjustments, catalog, common, octobox, purchases, reports,
 log = logging.getLogger("crudo")
 
 
-def build_dispatcher() -> Dispatcher:
-    dp = Dispatcher(storage=MemoryStorage())
+async def on_error(event: ErrorEvent) -> None:
+    """Будь-яка помилка в обробнику — у лог і коротко користувачеві, замість тиші."""
+    log.exception("handler error: %s", event.exception)
+    upd = event.update
+    msg = upd.message or (upd.callback_query.message if upd.callback_query else None)
+    if upd.callback_query:
+        try:
+            await upd.callback_query.answer("Сталася помилка", show_alert=False)
+        except Exception:
+            pass
+    if msg:
+        try:
+            await msg.answer(f"⚠️ Помилка: {type(event.exception).__name__}: {str(event.exception)[:300]}\n"
+                             "Спробуйте ще раз або натисніть /start. Якщо повторюється — напишіть адміністратору.")
+        except Exception:
+            pass
+
+
+def build_dispatcher(persistent: bool = True) -> Dispatcher:
+    dp = Dispatcher(storage=SQLiteStorage() if persistent else MemoryStorage())
+    dp.errors.register(on_error)
     dp.update.outer_middleware(common.DedupMiddleware())
     dp.message.outer_middleware(common.AuthMiddleware())
     dp.callback_query.outer_middleware(common.AuthMiddleware())
