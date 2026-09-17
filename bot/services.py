@@ -1317,3 +1317,20 @@ def conclusions(db: Database, rep: dict) -> list[str]:
     if exp:
         out.append("⏰ Спливає за 3 дні: " + ", ".join(f"{r['product_name']} до {r['expiry_date'][8:10]}.{r['expiry_date'][5:7]}" for r in exp[:4]) + ".")
     return out
+
+
+def reconcile_grouped(db: Database, date_from: str, date_to: str) -> list[dict]:
+    """Звірка: дні до першого чека з каси (історія місячними блоками) — по місяцях, далі — по днях."""
+    first = db.one("SELECT MIN(sale_date) d FROM sales WHERE client_key LIKE 'octobox:%'")
+    cut = first["d"] if first and first["d"] else "9999-12-31"
+    rows = reconcile(db, date_from, date_to)
+    out: dict[str, dict] = {}
+    for r in rows:
+        key = r["day"] if r["day"] >= cut else r["day"][:7]
+        e = out.setdefault(key, {"day": key, "bot_total": ZERO, "reg_total": None, "monthly": len(key) == 7})
+        e["bot_total"] += r["bot_total"]
+        if r["reg_total"] is not None:
+            e["reg_total"] = (e["reg_total"] or ZERO) + r["reg_total"]
+    for e in out.values():
+        e["diff"] = (e["bot_total"] - e["reg_total"]) if e["reg_total"] is not None else None
+    return [out[k] for k in sorted(out)]

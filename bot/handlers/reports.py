@@ -556,19 +556,21 @@ async def rep_cb(cb: CallbackQuery, state: FSMContext, db, user):
                 await refresh_register_days(user["telegram_id"], d1, d2)
             except Exception as e:
                 await cb.message.answer(f"⚠️ Не вдалося отримати дані каси онлайн: {e}. Показую те, що є з файлів.")
-        rows = S.reconcile(db, d1, d2)
+        rows = S.reconcile_grouped(db, d1, d2)
         if not rows:
             await cb.message.answer("За період немає ні продажів, ні даних каси.")
         else:
-            txt = ["🧾 <b>Звірка бот ↔ каса</b>"]
+            txt = ["🧾 <b>Звірка бот ↔ каса</b>" + (" (історія до підключення каси — по місяцях)" if any(r["monthly"] for r in rows) else "")]
             m = lambda v: f"{v:,.2f}".replace(",", " ").replace(".", ",")
+            MON = ["січ", "лют", "бер", "кві", "тра", "чер", "лип", "сер", "вер", "жов", "лис", "гру"]
             txt.append("дата       бот      каса   різниця")
             for r in rows:
+                lbl = f"{MON[int(r['day'][5:7]) - 1]:<5}" if r["monthly"] else ua_date(r["day"])[:5]
                 if r["reg_total"] is None:
-                    txt.append(f"{ua_date(r['day'])[:5]} {m(r['bot_total']):>9}         —")
+                    txt.append(f"{lbl} {m(r['bot_total']):>9}         —")
                 else:
-                    flag = "✅" if r["diff"] == 0 else "⚠️"
-                    txt.append(f"{ua_date(r['day'])[:5]} {m(r['bot_total']):>9} {m(r['reg_total']):>9} {m(r['diff']):>8}{flag}")
+                    flag = "✅" if abs(r["diff"]) < Decimal("0.05") else "⚠️"
+                    txt.append(f"{lbl} {m(r['bot_total']):>9} {m(r['reg_total']):>9} {m(r['diff']):>8}{flag}")
             tot_b = sum((r["bot_total"] for r in rows), Decimal(0)); tot_r = sum((r["reg_total"] or Decimal(0) for r in rows), Decimal(0))
             txt.append(f"Разом {m(tot_b):>9} {m(tot_r):>9} {m(tot_b - tot_r):>8}")
             await cb.message.answer(txt[0] + "\n<pre>" + "\n".join(txt[1:]) + "</pre>\n<i>Каса — з бек-офісу Octobox (онлайн) або з імпортованої виписки.</i>")
