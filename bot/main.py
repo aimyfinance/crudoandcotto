@@ -4,7 +4,11 @@ import asyncio
 import datetime as dt
 import logging
 
+import html
+import re
+
 from aiogram import Bot, Dispatcher
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -20,6 +24,37 @@ from .handlers import adjustments, catalog, common, octobox, purchases, reports,
 log = logging.getLogger("crudo")
 
 
+_ALLOWED_TAG = re.compile(r"</?(b|i|u|s|code|pre|a|tg-spoiler)(\s[^>]*)?>", re.I)
+
+
+def escape_unknown_tags(text: str) -> str:
+    """Екранує «<» і «>», що не є нашими HTML-тегами (b, i, pre, code…), щоб Telegram не падав на «<class …>»."""
+    out, pos = [], 0
+    for m in _ALLOWED_TAG.finditer(text):
+        out.append(html.escape(text[pos:m.start()], quote=False))
+        out.append(m.group(0))
+        pos = m.end()
+    out.append(html.escape(text[pos:], quote=False))
+    return "".join(out).replace("&amp;lt;", "&lt;").replace("&amp;gt;", "&gt;").replace("&amp;amp;", "&amp;")
+
+
+class SafeBot(Bot):
+    """Якщо Telegram не може розібрати HTML у тексті — повторює надсилання з екранованими символами."""
+
+    async def __call__(self, method, request_timeout=None):
+        try:
+            return await super().__call__(method, request_timeout)
+        except TelegramBadRequest as e:
+            if "can't parse entities" not in str(e):
+                raise
+            for field in ("text", "caption"):
+                val = getattr(method, field, None)
+                if val:
+                    fixed = method.model_copy(update={field: escape_unknown_tags(val)})
+                    return await super().__call__(fixed, request_timeout)
+            raise
+
+
 async def on_error(event: ErrorEvent) -> None:
     """Будь-яка помилка в обробнику — у лог і коротко користувачеві, замість тиші."""
     log.exception("handler error: %s", event.exception)
@@ -32,7 +67,7 @@ async def on_error(event: ErrorEvent) -> None:
             pass
     if msg:
         try:
-            await msg.answer(f"⚠️ Помилка: {type(event.exception).__name__}: {str(event.exception)[:300]}\n"
+            await msg.answer(f"⚠️ Помилка: {type(event.exception).__name__}: {html.escape(str(event.exception)[:300])}\n"
                              "Спробуйте ще раз або натисніть /start. Якщо повторюється — напишіть адміністратору.")
         except Exception:
             pass
@@ -95,7 +130,7 @@ async def main() -> None:
     settings.validate()
     db = get_db()
     S.ensure_admins(db, settings.admin_ids)
-    bot = Bot(settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    bot = SafeBot(settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = build_dispatcher()
     from . import webapp as _webapp
     _webapp.request_bot["bot"] = bot
