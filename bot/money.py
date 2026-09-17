@@ -98,13 +98,12 @@ def fmt_money(v: Decimal | str | None) -> str:
 
 
 def fmt_price(v: Decimal | str | None) -> str:
+    """Ціна: завжди 2 знаки (14,60), якщо є копійки дрібніші за цент — 4 знаки (14,3315)."""
     if v is None:
         return "—"
-    v = Decimal(v).normalize()
-    if v == v.to_integral():
-        s = f"{v:.0f}"
-    else:
-        s = f"{v:.4f}".rstrip("0").rstrip(".")
+    v = Decimal(v)
+    q2 = v.quantize(Decimal("0.01"))
+    s = f"{q2:.2f}" if q2 == v else f"{v:.4f}".rstrip("0")
     return s.replace(".", ",")
 
 

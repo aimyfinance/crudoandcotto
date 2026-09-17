@@ -37,6 +37,7 @@ M_INVOICE = "📄 Закупівля з інвойсу"
 M_PURCH_MANUAL = "✍️ Закупівля вручну"
 M_DOCS_PURCH = "🗂 Інвойси"
 M_PURCH_CANCEL = "🗑 Скасувати закупівлю"
+M_LOG = "🕘 Журнал дій"
 M_EXPIRY = "⏰ Терміни придатності"
 M_OPENING = "➕ Початковий залишок"
 M_EXP_ADD = "➕ Додати витрату"
@@ -51,13 +52,13 @@ M_REP_PERIOD = "🔎 Період"
 GROUPS = {G_CASH, G_PURCH, G_STOCK, G_EXP, G_REP, G_HOME}
 
 ROLE_MENUS = {
-    "admin": [[M_TASKS, G_CASH], [G_PURCH, G_STOCK], [G_EXP, G_REP], [M_SETTINGS]],
-    "manager": [[M_TASKS, G_CASH], [G_PURCH, G_STOCK], [G_EXP, G_REP], [M_SETTINGS]],
+    "admin": [[M_TASKS, G_CASH], [G_PURCH, G_STOCK], [G_EXP, G_REP], [M_LOG, M_SETTINGS]],
+    "manager": [[M_TASKS, G_CASH], [G_PURCH, G_STOCK], [G_EXP, G_REP], [M_LOG, M_SETTINGS]],
     "seller": [[M_TASKS, G_CASH], [G_STOCK]],
 }
 SUBMENUS = {
     G_CASH: {"seller": [[M_SALE, M_HISTORY]], "manager": [[M_SALE, M_HISTORY], [M_SALE_SUMMARY]]},
-    G_PURCH: {"manager": [[M_INVOICE, M_PURCH_MANUAL], [M_BATCHES, M_DOCS_PURCH], [M_PUR_SUMMARY, M_PURCHASE + " (останні)"]]},
+    G_PURCH: {"manager": [[M_INVOICE, M_PURCH_MANUAL], [M_BATCHES, M_DOCS_PURCH], [M_PUR_SUMMARY, M_PURCHASE + " (останні)"], [M_PURCH_CANCEL]]},
     G_STOCK: {"seller": [[M_STOCK, M_EXPIRY], [M_BATCHES]],
               "manager": [[M_STOCK, M_EXPIRY], [M_WRITEOFF, M_PRODUCTS], [M_BATCHES, M_OPENING]]},
     G_EXP: {"manager": [[M_EXP_SUMMARY], [M_EXP_ADD, M_EXP_LIST], [M_DOCS_EXP]]},
@@ -80,6 +81,20 @@ def _shift_btn() -> str:
 def main_menu(role: str) -> ReplyKeyboardMarkup:
     rows = [[KeyboardButton(text=t) for t in r] for r in ROLE_MENUS.get(role, ROLE_MENUS["seller"])]
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+
+def menu_for(user) -> ReplyKeyboardMarkup:
+    """Клавіатура після дії: поточна група користувача (якщо відкрита) або головне меню."""
+    try:
+        from .db import get_db
+        grp = S.setting_get(get_db(), f"grp:{user['telegram_id']}")
+        if grp:
+            kb = submenu(grp, user["role"])
+            if kb:
+                return kb
+    except Exception:
+        pass
+    return main_menu(user["role"])
 
 
 def submenu(group: str, role: str) -> ReplyKeyboardMarkup | None:
@@ -120,18 +135,29 @@ def inline(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
 CAT_SHORT = {"cheese": "🧀 Сири", "meat": "🥩 М'ясо", "pasta": "🍝 Паста"}
 
 
+STOCK_CTX = {"wo", "inv", "bt", "sale"}   # контексти, де показуємо залишок і ховаємо нульові
+
+
 def product_picker(db, ctx: str, category: str | None = None, page: int = 0, per_page: int = 8,
                    show_price: bool = True, active_only: bool = True) -> InlineKeyboardMarkup:
     """Вибір товару: фільтр за категорією + сторінки. callback: pp:{ctx}:id:{product_id}"""
+    from .money import fmt_grams
     kb = InlineKeyboardBuilder()
     kb.row(*[InlineKeyboardButton(text=("• " if category == c else "") + t, callback_data=f"pp:{ctx}:cat:{c}")
              for c, t in CAT_SHORT.items()])
     prods = S.list_products(db, active_only=active_only, category=category)
+    stock = {}
+    if ctx in STOCK_CTX:
+        stock = {r["product"]["id"]: r["grams"] for r in S.stock_summary(db, include_zero=True)}
+        prods = sorted([p for p in prods if stock.get(p["id"], 0) > 0], key=lambda p: -stock.get(p["id"], 0))
     total = len(prods)
     chunk = prods[page * per_page:(page + 1) * per_page]
     for p in chunk:
         label = p["name"]
-        if show_price:
+        if ctx in STOCK_CTX:
+            g = stock.get(p["id"], 0)
+            label = f"{p['name'][:30]} · {(str(g // p['piece_grams']) + ' шт') if p['sale_mode'] == 'piece' and p['piece_grams'] and g >= p['piece_grams'] else fmt_grams(g)}"
+        elif show_price:
             unit = "шт" if p["sale_mode"] == "piece" else "кг"
             label += f" — {fmt_price(p['retail_price'])} €/{unit}"
         kb.row(InlineKeyboardButton(text=label[:60], callback_data=f"pp:{ctx}:id:{p['id']}"))
@@ -143,5 +169,5 @@ def product_picker(db, ctx: str, category: str | None = None, page: int = 0, per
     if nav:
         kb.row(*nav)
     if total == 0:
-        kb.row(InlineKeyboardButton(text="(немає товарів)", callback_data="noop"))
+        kb.row(InlineKeyboardButton(text="(немає товарів у наявності)" if ctx in STOCK_CTX else "(немає товарів)", callback_data="noop"))
     return kb.as_markup()

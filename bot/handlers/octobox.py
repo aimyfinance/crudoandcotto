@@ -76,9 +76,9 @@ async def run_sync(bot: Bot | None, user_id: int, since_days: int = 2, notify: b
         last_dt = max(r["dt"] for r in todays)
         if dt.datetime.now(TZ).replace(tzinfo=None) - last_dt > dt.timedelta(minutes=90):
             S.close_shift(db, user_id, note="авто за Octobox")
-            rep = S.report_period(db, today, today)
+            from .tasks import day_summary_text
             if bot:
-                await _notify(bot, db, f"⏹ Каса закрита (останній чек Octobox о {last_dt:%H:%M}). Продажів: {rep['sales_count']} · виручка {fmt_money(rep['revenue'])}")
+                await _notify(bot, db, f"⏹ Каса закрита (останній чек Octobox о {last_dt:%H:%M}).\n\n" + day_summary_text(db, today))
     if bot and notify and (st["created"] or st.get("completed") or st["unmatched"]):
         txt = f"🔄 Octobox: нових чеків {st['created']}"
         if st.get("completed"):

@@ -12,7 +12,7 @@ from aiogram.types import CallbackQuery, Message, TelegramObject, Update
 from .. import services as S
 from ..config import settings
 from ..db import get_db, today_local
-from ..keyboards import BACK, CANCEL, G_CASH, G_EXP, G_HOME, G_PURCH, G_REP, G_STOCK, GROUPS, main_menu, submenu
+from ..keyboards import menu_for, BACK, CANCEL, G_CASH, G_EXP, G_HOME, G_PURCH, G_REP, G_STOCK, GROUPS, main_menu, submenu
 
 router = Router(name="common")
 
@@ -106,7 +106,7 @@ class Flow:
 
 async def cancel_to_menu(msg: Message, state: FSMContext, user, text: str = "Скасовано.") -> None:
     await state.clear()
-    await msg.answer(text, reply_markup=main_menu(user["role"]))
+    await msg.answer(text, reply_markup=menu_for(user))
 
 
 def role_menu_text(user) -> str:
@@ -153,9 +153,10 @@ def ua_date(iso: str | None) -> str:
 @router.message(Command("menu"))
 async def cmd_start(msg: Message, state: FSMContext, user):
     await state.clear()
+    S.setting_set(get_db(), f"grp:{user['telegram_id']}", "")
     await msg.answer(
         f"Вітаю, {user['name'] or 'колего'}! Це облік {settings.company_name}.\n{role_menu_text(user)}",
-        reply_markup=main_menu(user["role"]),
+        reply_markup=menu_for(user),
     )
 
 
@@ -185,17 +186,24 @@ GROUP_TITLES = {G_CASH: "🧾 Каса", G_PURCH: "📦 Закупівлі", G_S
 async def open_group(msg: Message, state: FSMContext, user):
     await state.clear()
     if msg.text == G_HOME:
-        return await msg.answer(role_menu_text(user), reply_markup=main_menu(user["role"]))
+        return await msg.answer(role_menu_text(user), reply_markup=menu_for(user))
     kb = submenu(msg.text, user["role"])
     if kb is None:
-        return await msg.answer("Цей розділ недоступний для вашої ролі.", reply_markup=main_menu(user["role"]))
+        return await msg.answer("Цей розділ недоступний для вашої ролі.", reply_markup=menu_for(user))
     hint = ""
     if msg.text == G_CASH:
         from .. import services as _S
         from ..db import get_db as _g
         sh = _S.current_shift(_g())
-        from ..db import local_dt_str as _l
+        from ..db import local_dt_str as _l, today_local as _t
+        from ..money import fmt_money as _m
         hint = f"\nЗміна відкрита о {_l(sh['opened_at'])[-5:]} · {sh['opened_name'] or ''}" if sh else "\nЗміна не відкрита"
+        rep = _S.report_period(_g(), _t(), _t())
+        if rep["sales_count"]:
+            pay = ", ".join(f"{_S.PAYMENTS[k].lower()} {_m(v)}" for k, v in rep["by_payment"].items())
+            hint += f"\nСьогодні: <b>{_m(rep['revenue'])}</b> · {rep['sales_count']} чеків · {pay}"
+        else:
+            hint += "\nСьогодні продажів ще немає"
     await msg.answer(GROUP_TITLES[msg.text] + hint, reply_markup=kb)
 
 
@@ -207,5 +215,5 @@ async def noop(cb: CallbackQuery):
 @router.callback_query(F.data == "menu")
 async def cb_menu(cb: CallbackQuery, state: FSMContext, user):
     await state.clear()
-    await cb.message.answer(role_menu_text(user), reply_markup=main_menu(user["role"]))
+    await cb.message.answer(role_menu_text(user), reply_markup=menu_for(user))
     await cb.answer()

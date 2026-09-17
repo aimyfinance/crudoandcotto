@@ -15,7 +15,7 @@ from aiogram.types import CallbackQuery, FSInputFile, Message
 from .. import services as S
 from ..config import TZ
 from ..db import get_db, local_dt_str, today_local
-from ..keyboards import M_SHIFT_CLOSE, M_SHIFT_OPEN, M_TASKS, SKIP, inline, main_menu, nav_kb
+from ..keyboards import menu_for, M_SHIFT_CLOSE, M_SHIFT_OPEN, M_TASKS, SKIP, inline, main_menu, nav_kb
 from ..money import ParseError, fmt_grams, fmt_money, parse_money
 from .common import has_role, parse_date, ua_date
 
@@ -44,7 +44,7 @@ async def tasks_menu(msg: Message, state: FSMContext, db, user):
     await state.clear()
     rows = S.tasks_for(db, user["telegram_id"], user["role"])
     txt = "📋 <b>Завдання</b>\n" + ("\n".join(_task_line(t) for t in rows) if rows else "Відкритих завдань немає.")
-    await msg.answer(txt, reply_markup=main_menu(user["role"]))
+    await msg.answer(txt, reply_markup=menu_for(user))
     kb = [[(f"✅ №{t['id']}", f"task:done:{t['id']}") for t in rows[i:i + 3]] for i in range(0, min(len(rows), 12), 3)]
     if has_role(user, "manager"):
         kb.append([("➕ Нове завдання", "task:new"), ("✔️ Виконані", "task:done_list")])
@@ -110,13 +110,22 @@ async def task_who(cb: CallbackQuery, state: FSMContext):
     v = cb.data.split(":")[2]
     await state.update_data(task_who=None if v == "all" else int(v))
     await state.set_state(Task.text)
-    await cb.message.answer("Текст завдання:", reply_markup=nav_kb(back=False))
+    await cb.message.answer("Текст завдання (або оберіть шаблон):", reply_markup=nav_kb("📦 Дозамовити…", "✂️ Списати прострочене", "🧾 Звірити касу", back=False))
     await cb.answer()
 
 
 @router.message(StateFilter(Task.text), F.text)
-async def task_text(msg: Message, state: FSMContext):
-    await state.update_data(task_text=msg.text.strip()[:500])
+async def task_text(msg: Message, state: FSMContext, db):
+    text = msg.text.strip()
+    if text.startswith("📦 Дозамовити"):
+        low = S.low_stock(db)
+        text = "Дозамовити: " + ("; ".join(f"{r['product']['name']} (є {fmt_grams(r['grams'])})" for r in low) if low else "(вкажіть товари)")
+    elif text.startswith("✂️ Списати"):
+        exp = S.batches_expiring(db, 3)
+        text = "Списати прострочене: " + ("; ".join(f"{r['product_name']} {fmt_grams(r['grams_left'])} до {ua_date(r['expiry_date'])}" for r in exp) if exp else "перевірити терміни")
+    elif text.startswith("🧾 Звірити"):
+        text = "Звірити касу Octobox з ботом за вчора (Звіти → Звірка з касою)"
+    await state.update_data(task_text=text[:500])
     await state.set_state(Task.due)
     await msg.answer("Термін (дата) або пропустіть:", reply_markup=nav_kb(SKIP, "📅 Сьогодні", "📅 Завтра"))
 
@@ -137,7 +146,7 @@ async def task_due(msg: Message, state: FSMContext, db, user):
     data = await state.get_data()
     tid = S.create_task(db, user["telegram_id"], data["task_text"], data["task_who"], due)
     await state.clear()
-    await msg.answer(f"✅ Завдання №{tid} створено.", reply_markup=main_menu(user["role"]))
+    await msg.answer(f"✅ Завдання №{tid} створено.", reply_markup=menu_for(user))
     targets = [data["task_who"]] if data["task_who"] else [u["telegram_id"] for u in S.list_users(db) if u["active"] and u["telegram_id"] != user["telegram_id"]]
     for uid in targets:
         try:
@@ -159,7 +168,7 @@ class Shift(StatesGroup):
 @router.message(F.text == M_SHIFT_OPEN)
 async def shift_open(msg: Message, state: FSMContext, db, user):
     if S.current_shift(db):
-        return await msg.answer("Каса вже відкрита.", reply_markup=main_menu(user["role"]))
+        return await msg.answer("Каса вже відкрита.", reply_markup=menu_for(user))
     await state.set_state(Shift.cash_start)
     await msg.answer("▶️ Готівка в касі на старт, € (або пропустіть):", reply_markup=nav_kb(SKIP, back=False))
 
@@ -175,9 +184,9 @@ async def shift_open_cash(msg: Message, state: FSMContext, db, user):
     sid = S.open_shift(db, user["telegram_id"], cash)
     await state.clear()
     if not sid:
-        return await msg.answer("Каса вже відкрита.", reply_markup=main_menu(user["role"]))
+        return await msg.answer("Каса вже відкрита.", reply_markup=menu_for(user))
     t = dt.datetime.now(TZ).strftime("%H:%M")
-    await msg.answer(f"✅ Касу відкрито о {t}. Гарного ярмарку!", reply_markup=main_menu(user["role"]))
+    await msg.answer(f"✅ Касу відкрито о {t}. Гарного ярмарку!", reply_markup=menu_for(user))
     await _notify(msg.bot, db, f"▶️ Каса відкрита о {t} — {user['name'] or user['telegram_id']}"
                   + (f", готівка на старт {fmt_money(cash)}" if cash is not None else ""), exclude=user["telegram_id"])
 
@@ -185,7 +194,7 @@ async def shift_open_cash(msg: Message, state: FSMContext, db, user):
 @router.message(F.text == M_SHIFT_CLOSE)
 async def shift_close(msg: Message, state: FSMContext, db, user):
     if not S.current_shift(db):
-        return await msg.answer("Каса не відкрита.", reply_markup=main_menu(user["role"]))
+        return await msg.answer("Каса не відкрита.", reply_markup=menu_for(user))
     await state.set_state(Shift.cash_end)
     await msg.answer("⏹ Готівка в касі на кінець дня, € (або пропустіть):", reply_markup=nav_kb(SKIP, back=False))
 
@@ -201,7 +210,7 @@ async def shift_close_cash(msg: Message, state: FSMContext, db, user):
     s = S.close_shift(db, user["telegram_id"], cash)
     await state.clear()
     if not s:
-        return await msg.answer("Каса не відкрита.", reply_markup=main_menu(user["role"]))
+        return await msg.answer("Каса не відкрита.", reply_markup=menu_for(user))
     t = dt.datetime.now(TZ).strftime("%H:%M")
     rep = S.report_period(db, today_local(), today_local())
     summary = (f"⏹ Каса закрита о {t} — {user['name'] or user['telegram_id']} (відкрита о {local_dt_str(s['opened_at'])[-5:]})\n"
@@ -212,8 +221,8 @@ async def shift_close_cash(msg: Message, state: FSMContext, db, user):
         if s["cash_start"] is not None and rep["by_payment"].get("cash") is not None:
             expected = Decimal(s["cash_start"]) + rep["by_payment"]["cash"]
             summary += f" · очікувано {fmt_money(expected)} · різниця {fmt_money(cash - expected)}"
-    await msg.answer("✅ " + summary, reply_markup=main_menu(user["role"]))
-    await _notify(msg.bot, db, summary, exclude=user["telegram_id"])
+    await msg.answer("✅ " + summary, reply_markup=menu_for(user))
+    await _notify(msg.bot, db, summary + "\n\n" + day_summary_text(db, today_local()), exclude=user["telegram_id"])
 
 
 async def _notify(bot: Bot, db, text: str, exclude: int | None = None) -> None:
@@ -270,7 +279,40 @@ async def schedule_set(msg: Message, state: FSMContext, db, user):
         return await msg.answer("⚠️ Формат: <code>пт, сб 08:00-14:00</code>")
     S.setting_set(db, "market_schedule", msg.text.strip())
     await state.clear()
-    await msg.answer(f"✅ Графік: {schedule_text(db)}", reply_markup=main_menu(user["role"]))
+    await msg.answer(f"✅ Графік: {schedule_text(db)}", reply_markup=menu_for(user))
+
+
+def day_summary_text(db, day: str) -> str:
+    """Вечірній підсумок для менеджера: виручка, топ-3, що закінчується, що спливає."""
+    rep = S.report_period(db, day, day)
+    out = [f"🌙 <b>Підсумок дня {ua_date(day)}</b>",
+           f"Виручка <b>{fmt_money(rep['revenue'])}</b> · {rep['sales_count']} чеків · {fmt_grams(rep['sold_grams'])} · вал. прибуток {fmt_money(rep['gross_profit'])}"]
+    if rep["by_payment"]:
+        out.append("Оплата: " + ", ".join(f"{S.PAYMENTS[k].lower()} {fmt_money(v)}" for k, v in rep["by_payment"].items()))
+    if rep["by_product"]:
+        out.append("Топ-3: " + "; ".join(f"{e['name']} {fmt_money(e['amount'])}" for e in rep["by_product"][:3]))
+    low = S.low_stock(db)
+    if low:
+        out.append("📦 Закінчується: " + ", ".join(r["product"]["name"] for r in low[:6]))
+    exp = S.batches_expiring(db, 2)
+    if exp:
+        out.append("⏰ Спливає за 2 дні: " + ", ".join(f"{r['product_name']} ({fmt_grams(r['grams_left'])})" for r in exp[:6]))
+    return "\n".join(out)
+
+
+def week_start_text(db) -> str:
+    st = S.stock_summary(db)
+    out = [f"📅 <b>Початок тижня</b>: на складі {fmt_grams(sum(r['grams'] for r in st))} на {fmt_money(sum((r['cost_value'] for r in st), Decimal(0)))}"]
+    stale = S.stale_products(db, 14)
+    if stale:
+        out.append("🧊 Не продавались 14+ днів: " + ", ".join(f"{r['name']} ({fmt_grams(r['grams'])})" for r in sorted(stale, key=lambda r: -r["grams"])[:8]))
+    low = S.low_stock(db)
+    if low:
+        out.append("📦 Дозамовити: " + ", ".join(r["product"]["name"] for r in low[:8]))
+    exp = S.batches_expiring(db, 7)
+    if exp:
+        out.append("⏰ Спливає цього тижня: " + ", ".join(f"{r['product_name']} до {ua_date(r['expiry_date'])[:5]}" for r in exp[:8]))
+    return "\n".join(out)
 
 
 async def shift_watchdog(bot: Bot) -> None:
@@ -289,6 +331,9 @@ async def shift_watchdog(bot: Bot) -> None:
         if hm == close_alert and S.current_shift(db) and S.setting_get(db, "alert_close") != key_day:
             S.setting_set(db, "alert_close", key_day)
             await _notify(bot, db, f"⚠️ {sc['close']} + 30 хв — каса ще не закрита в боті.")
+    if now.weekday() == 0 and now.strftime("%H:%M") == "08:00" and S.setting_get(db, "alert_week") != key_day:
+        S.setting_set(db, "alert_week", key_day)
+        await _notify(bot, db, week_start_text(db))
     if now.strftime("%H:%M") == "09:00" and S.setting_get(db, "alert_tasks") != key_day:
         S.setting_set(db, "alert_tasks", key_day)
         for t in S.overdue_tasks(db, key_day):

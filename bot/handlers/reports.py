@@ -16,7 +16,7 @@ from .. import services as S
 from ..cash_import import parse_cash_report
 from ..config import TZ, settings
 from ..export import build_csv_movements, build_excel
-from ..keyboards import (CANCEL, M_DOCS_EXP, M_DOCS_PURCH, M_EXP_ADD, M_EXP_LIST, M_EXP_SUMMARY, M_PUR_SUMMARY, M_SALE_SUMMARY, M_REP_MONTH, M_REP_PERIOD, M_REP_TODAY,
+from ..keyboards import (menu_for, CANCEL, M_DOCS_EXP, M_DOCS_PURCH, M_EXP_ADD, M_EXP_LIST, M_EXP_SUMMARY, M_PUR_SUMMARY, M_SALE_SUMMARY, M_REP_MONTH, M_REP_PERIOD, M_REP_TODAY,
                          M_REPORTS, M_SETTINGS, inline, main_menu, nav_kb, product_picker)
 from ..money import fmt_grams, fmt_money, fmt_price
 from ..db import today_local, get_db
@@ -100,6 +100,36 @@ def period_kb_for(prefix: str):
                    [("📆 Свій період", f"{prefix}:custom")]])
 
 
+def _sh(name: str, n: int = 18) -> str:
+    return name if len(name) <= n else name[: n - 1] + "…"
+
+
+def _kg(g: int) -> str:
+    return f"{g / 1000:>5.2f}".replace(".", ",") if g >= 1000 else f"{g:>4} г".replace(" г", "г ")
+
+
+def table_products(rows, with_margin=True) -> str:
+    """Товари: назва · кг · € · маржа."""
+    out = []
+    for e in rows:
+        line = f"{_sh(e['name']):<18} {_kg(e['grams']):>6} {float(e['amount']):>7.0f}€"
+        if with_margin:
+            line += f" {float(e['margin_pct']):>3.0f}%"
+        out.append(line)
+    return "<pre>" + "\n".join(out) + "</pre>"
+
+
+def table_kv(rows, label_w=22) -> str:
+    """Пари «назва — значення» (і необов'язково третя колонка)."""
+    out = []
+    for r in rows:
+        line = f"{_sh(str(r[0]), label_w):<{label_w}} {str(r[1]):>10}"
+        if len(r) > 2:
+            line += f"  {r[2]}"
+        out.append(line)
+    return "<pre>" + "\n".join(out) + "</pre>"
+
+
 def report_text(rep: dict) -> str:
     p = f"{ua_date(rep['date_from'])}" if rep["date_from"] == rep["date_to"] else f"{ua_date(rep['date_from'])} — {ua_date(rep['date_to'])}"
     out = [f"📈 <b>Звіт за {p}</b>",
@@ -123,9 +153,8 @@ def report_text(rep: dict) -> str:
             out.append(f"<i>Довідково: оплата товару {fmt_money(ex['goods'])}, інвестиції {fmt_money(ex['investment'])}</i>")
     out.append(f"Поточні залишки: {fmt_grams(rep['stock_grams'])} на {fmt_money(rep['stock_value'])}")
     if rep["by_product"]:
-        out.append("\n<b>Продажі за товарами</b> (виручка · вал. прибуток · маржа)")
-        for e in rep["by_product"][:15]:
-            out.append(f"• {e['name']}: {fmt_grams(e['grams'])} · {fmt_money(e['amount'])} · {fmt_money(e['gross_profit'])} · {e['margin_pct']:.0f} %")
+        out.append("\n<b>Продажі за товарами</b> — кг · виручка · маржа")
+        out.append(table_products(rep["by_product"][:15]))
     out.append("\n<i>Валовий прибуток = виручка − собівартість проданого (з транспортом). Це не чистий прибуток.</i>")
     return "\n".join(out)
 
@@ -144,7 +173,7 @@ async def reports(msg: Message, state: FSMContext, user):
     if not has_role(user, "manager"):
         return await msg.answer("Звіти доступні менеджеру й адміністратору.")
     await state.clear()
-    await msg.answer("📈 <b>Звіти</b> — оберіть період:", reply_markup=main_menu(user["role"]))
+    await msg.answer("📈 <b>Звіти</b> — оберіть період:", reply_markup=menu_for(user))
     await msg.answer("Період:", reply_markup=period_kb("rep"))
     await msg.answer("Витрати:", reply_markup=inline([[("➕ Додати витрату", "exp:add"), ("🗑 Останні витрати", "exp:list")]]))
 
@@ -231,16 +260,13 @@ def purchases_summary_text(db, d1: str, d2: str) -> str:
                + (f" + транспорт/інше {fmt_money(pu['extra'])}" if pu["extra"] else ""))
     if pu["grams"]:
         out.append(f"Середня ціна з витратами: {fmt_price(((pu['amount'] + pu['extra']) * 1000 / pu['grams']).quantize(Decimal('0.01')))} €/кг")
-    out.append("\n<b>За постачальниками</b>")
-    for sup, (g, a, n) in sorted(pu["by_supplier"].items(), key=lambda x: -x[1][1]):
-        out.append(f"• {sup}: {n} док. · {fmt_grams(g)} · {fmt_money(a)}")
-    out.append("\n<b>Найбільше закуплено (€)</b>")
-    for r in pu["top"]:
-        out.append(f"• {r['name']}: {fmt_grams(int(r['g']))} · {fmt_money(Decimal(str(r['a'])))}")
+    out.append("\n<b>За постачальниками</b> — док. · кг · €")
+    out.append(table_kv([(sup, f"{n} док.", f"{fmt_grams(g):>9} {fmt_money(a):>11}") for sup, (g, a, n) in sorted(pu["by_supplier"].items(), key=lambda x: -x[1][1])], 18))
+    out.append("<b>Найбільше закуплено</b> — кг · €")
+    out.append(table_products([{"name": r["name"], "grams": int(r["g"]), "amount": Decimal(str(r["a"])), "margin_pct": 0} for r in pu["top"]], with_margin=False))
     if pu["count"] <= 12:
-        out.append("\n<b>Документи</b>")
-        for r in pu["rows"]:
-            out.append(f"• №{r['id']} {ua_date(r['doc_date'])} {r['supplier'] or ''} — {fmt_money(Decimal(str(r['amount'] or 0)))}" + (f" · {r['comment']}" if r["comment"] else ""))
+        out.append("<b>Документи</b>")
+        out.append(table_kv([(f"№{r['id']} {ua_date(r['doc_date'])[:5]} {(r['supplier'] or '')[:12]}", fmt_money(Decimal(str(r["amount"] or 0)))) for r in pu["rows"]], 24))
     return "\n".join(out)
 
 
@@ -261,11 +287,9 @@ def sales_summary_text(db, d1: str, d2: str) -> str:
     days = S.sales_by_day(db, d1, d2)
     if 1 < len(days) <= 31:
         out.append("\n<b>По днях</b>")
-        for r in days:
-            out.append(f"• {ua_date(r['sale_date'])}: {fmt_money(Decimal(str(r['t'])))} ({r['n']} чек.)")
-    out.append("\n<b>Топ товарів</b> (виручка · маржа)")
-    for e in rep["by_product"][:10]:
-        out.append(f"• {e['name']}: {fmt_grams(e['grams'])} · {fmt_money(e['amount'])} · {e['margin_pct']:.0f} %")
+        out.append("<pre>" + "\n".join(f"{ua_date(r['sale_date'])[:5]}  {fmt_money(Decimal(str(r['t']))):>11}  {r['n']:>3} чек." for r in days) + "</pre>")
+    out.append("<b>Топ товарів</b> — кг · виручка · маржа")
+    out.append(table_products(rep["by_product"][:10]))
     return "\n".join(out)
 
 
@@ -439,7 +463,7 @@ async def exp_edit_value(msg: Message, state: FSMContext, db, user):
     await state.clear()
     e = S.get_expense(db, eid)
     await msg.answer("✅ Змінено.\n" + expense_card(e), reply_markup=expense_card_kb(e))
-    await msg.answer("Готово.", reply_markup=main_menu(user["role"]))
+    await msg.answer("Готово.", reply_markup=menu_for(user))
 
 
 @router.message(StateFilter(None), F.text.in_({M_DOCS_PURCH, M_DOCS_EXP}))
@@ -478,7 +502,11 @@ async def rep_period(msg: Message, state: FSMContext, db, user):
 
 async def _send_report(msg: Message, db, user, d1: str, d2: str):
     rep = S.report_period(db, d1, d2)
-    await msg.answer(report_text(rep), reply_markup=main_menu(user["role"]))
+    txt = report_text(rep)
+    concl = S.conclusions(db, rep)
+    if concl:
+        txt += "\n\n<b>Висновки</b>\n" + "\n".join(concl)
+    await msg.answer(txt, reply_markup=menu_for(user))
     kb = export_kb(d1, d2)
     kb.inline_keyboard.append([InlineKeyboardButton(text="🔁 Інший період", callback_data="rep:menu")])
     await msg.answer("Експорт:", reply_markup=kb)
@@ -646,13 +674,13 @@ async def exp_photo(msg: Message, state: FSMContext, db, user):
         name = "receipt.jpg"
     save_document(db, user["telegram_id"], "expense", data["exp_id"], name, buf.getvalue())
     await state.clear()
-    await msg.answer("📁 Чек збережено в архів витрат.", reply_markup=main_menu(user["role"]))
+    await msg.answer("📁 Чек збережено в архів витрат.", reply_markup=menu_for(user))
 
 
 @router.message(StateFilter(Exp.photo), F.text)
 async def exp_photo_skip(msg: Message, state: FSMContext, user):
     await state.clear()
-    await msg.answer("Гаразд, без документа.", reply_markup=main_menu(user["role"]))
+    await msg.answer("Гаразд, без документа.", reply_markup=menu_for(user))
 
 
 @router.callback_query(F.data == "exp:list")
@@ -690,11 +718,11 @@ async def reset_db_start(msg: Message, state: FSMContext, user):
 async def reset_db_confirm(msg: Message, state: FSMContext, db, user):
     await state.clear()
     if msg.text.strip() != "ВИДАЛИТИ":
-        return await msg.answer("Скасовано, нічого не видалено.", reply_markup=main_menu(user["role"]))
+        return await msg.answer("Скасовано, нічого не видалено.", reply_markup=menu_for(user))
     path = db.make_backup()
     await msg.answer_document(FSInputFile(path), caption="💾 Копія бази перед очищенням — збережіть.")
     S.reset_all_data(db, user["telegram_id"])
-    await msg.answer("🧹 Базу очищено. Тепер можна імпортувати історію.", reply_markup=main_menu(user["role"]))
+    await msg.answer("🧹 Базу очищено. Тепер можна імпортувати історію.", reply_markup=menu_for(user))
 
 
 # ---------------- налаштування ----------------
@@ -717,7 +745,7 @@ async def settings_menu(msg: Message, state: FSMContext, user):
         return
     await state.clear()
     await msg.answer(f"⚙️ <b>Налаштування</b>\nЧасовий пояс звітів: Europe/Vienna · Ваш ID: <code>{user['telegram_id']}</code>",
-                     reply_markup=main_menu(user["role"]))
+                     reply_markup=menu_for(user))
     await msg.answer("Оберіть:", reply_markup=settings_kb(user))
 
 
@@ -785,7 +813,7 @@ async def set_adduser_text(msg: Message, state: FSMContext, db, user):
         return await msg.answer("⚠️ Формат: <code>123456789 seller Марія</code>")
     S.upsert_user(db, int(parts[0]), parts[1], parts[2] if len(parts) > 2 else "")
     await state.clear()
-    await msg.answer(f"✅ Користувача {parts[0]} додано як {S.ROLES[parts[1]]}.", reply_markup=main_menu(user["role"]))
+    await msg.answer(f"✅ Користувача {parts[0]} додано як {S.ROLES[parts[1]]}.", reply_markup=menu_for(user))
 
 
 @router.callback_query(F.data == "set:backup")
@@ -826,7 +854,7 @@ async def restore_file(msg: Message, state: FSMContext, db, user):
     finally:
         tmp.unlink(missing_ok=True)
     await state.clear()
-    await msg.answer("✅ Базу відновлено з файлу.", reply_markup=main_menu(user["role"]))
+    await msg.answer("✅ Базу відновлено з файлу.", reply_markup=menu_for(user))
 
 
 @router.callback_query(F.data == "set:prodimport")
@@ -857,7 +885,7 @@ async def prod_import_file(msg: Message, state: FSMContext, user):
     txt = f"✅ Створено товарів: {created}\nПропущено (вже були): {skipped}"
     if errors:
         txt += "\n\n⚠️ Помилки:\n" + "\n".join(errors[:15])
-    await msg.answer(txt, reply_markup=main_menu(user["role"]))
+    await msg.answer(txt, reply_markup=menu_for(user))
 
 
 @router.callback_query(F.data == "set:openimport")
@@ -888,7 +916,7 @@ async def open_import_file(msg: Message, state: FSMContext, user):
     txt = f"✅ Створено партій початкового залишку: {created}"
     if errors:
         txt += "\n\n⚠️ Помилки:\n" + "\n".join(errors[:15])
-    await msg.answer(txt, reply_markup=main_menu(user["role"]))
+    await msg.answer(txt, reply_markup=menu_for(user))
 
 
 @router.callback_query(F.data == "set:histimport")
@@ -920,7 +948,7 @@ async def hist_import_file(msg: Message, state: FSMContext, user):
            f"Створено нових товарів: {st['products_created']}\nВирівнювань до звіту: {st['aligned']}")
     if st["errors"]:
         txt += "\n\n⚠️ Помилки:\n" + "\n".join(st["errors"][:15])
-    await msg.answer(txt, reply_markup=main_menu(user["role"]))
+    await msg.answer(txt, reply_markup=menu_for(user))
 
 
 @router.callback_query(F.data == "set:expimport")
@@ -947,7 +975,7 @@ async def exp_import_file(msg: Message, state: FSMContext, user):
     txt = f"✅ Витрат додано: {created}, пропущено (дублікати): {skipped}"
     if errors:
         txt += "\n\n⚠️ Помилки:\n" + "\n".join(errors[:15])
-    await msg.answer(txt, reply_markup=main_menu(user["role"]))
+    await msg.answer(txt, reply_markup=menu_for(user))
 
 
 # ---------------- Octobox: імпорт чеків по позиціях ----------------
@@ -1090,7 +1118,7 @@ async def octo_run(cb: CallbackQuery, state: FSMContext, db, user):
         c = Counter(x.split(" +")[0] for x in st["shortfalls"])
         txt.append("⚠️ Продано більше, ніж було в залишку — нестачу дооприбутковано автоматично (внесіть закупівлі й перевірте партії): "
                    + ", ".join(f"{k} ({v} поз.)" for k, v in c.items()))
-    await cb.message.answer("\n".join(txt), reply_markup=main_menu(user["role"]))
+    await cb.message.answer("\n".join(txt), reply_markup=menu_for(user))
 
 
 @router.callback_query(F.data == "set:aliases")
@@ -1135,5 +1163,5 @@ async def cash_save(cb: CallbackQuery, state: FSMContext, db, user):
     for day, v in data["cash_days"].items():
         S.save_cash_day(db, user["telegram_id"], day, Decimal(v["cash"]), Decimal(v["card"]), data.get("cash_name"))
     await state.clear()
-    await cb.message.answer("✅ Дані каси збережено. Звірка: Звіти → період → «Звірка з касою».", reply_markup=main_menu(user["role"]))
+    await cb.message.answer("✅ Дані каси збережено. Звірка: Звіти → період → «Звірка з касою».", reply_markup=menu_for(user))
     await cb.answer()

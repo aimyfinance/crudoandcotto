@@ -14,7 +14,7 @@ from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton
 from .. import services as S
 from ..db import get_db, today_local
 from ..export import build_csv_stock
-from ..keyboards import BACK, CAT_SHORT, M_BATCHES, M_EXPIRY, M_OPENING, M_PRODUCTS, M_STOCK, SKIP, inline, main_menu, nav_kb, product_picker
+from ..keyboards import menu_for, BACK, CAT_SHORT, M_BATCHES, M_EXPIRY, M_OPENING, M_PRODUCTS, M_STOCK, SKIP, inline, main_menu, nav_kb, product_picker
 from ..config import settings
 from ..money import ParseError, d, fmt_grams, fmt_money, fmt_price, parse_money, parse_weight_grams, round_cents
 from .common import Flow, has_role, parse_date, ua_date
@@ -70,24 +70,69 @@ async def stock(msg: Message, db, user):
     await msg.answer("Деталі:", reply_markup=kb)
 
 
+@router.callback_query(F.data.startswith("exp:wo:"))
+async def expiry_writeoff(cb: CallbackQuery, db, user):
+    if not has_role(user, "manager"):
+        return await cb.answer("Недостатньо прав", show_alert=True)
+    parts = cb.data.split(":")
+    bid = int(parts[2])
+    b = db.one("SELECT b.*, p.name FROM batches b JOIN products p ON p.id=b.product_id WHERE b.id=?", (bid,))
+    if not b or b["grams_left"] <= 0:
+        return await cb.answer("Партія вже порожня", show_alert=True)
+    if len(parts) == 3:
+        await cb.message.answer(f"Списати партію #{bid} {b['name']} — {fmt_grams(b['grams_left'])} (термін до {ua_date(b['expiry_date'])})?",
+                                reply_markup=inline([[("✂️ Так, списати", f"exp:wo:{bid}:yes"), ("Ні", "noop")]]))
+        return await cb.answer()
+    S.write_off(db, user["telegram_id"], b["product_id"], b["grams_left"], "Зіпсувалось / термін", batch_id=bid)
+    await cb.message.answer(f"✅ Списано {fmt_grams(b['grams_left'])} {b['name']} (партія #{bid}).")
+    await cb.answer()
+
+
 @router.message(StateFilter(None), F.text == M_EXPIRY)
-async def stock_expiry_msg(msg: Message, db):
+async def stock_expiry_msg(msg: Message, db, user):
     rows = S.batches_expiring(db, 14)
     if not rows:
         return await msg.answer("Найближчі 14 днів терміни не спливають.")
-    await msg.answer("⏰ <b>Терміни придатності (14 днів)</b>\n" + "\n".join(
-        f"• {ua_date(r['expiry_date'])} — {r['product_name']}: {fmt_grams(r['grams_left'])}" for r in rows))
+    lines = ["  до     товар                 залишок"]
+    for r in rows:
+        lines.append(f"{ua_date(r['expiry_date'])[:5]}  {_short(r['product_name'], 21):<21} {fmt_grams(r['grams_left']):>9}")
+    await msg.answer("⏰ <b>Терміни придатності (14 днів)</b>\n<pre>" + "\n".join(lines) + "</pre>")
+    if has_role(user, "manager"):
+        await msg.answer("Списати партію цілком (прострочене):", reply_markup=inline(
+            [[(f"✂️ {r['product_name'][:24]} · {fmt_grams(r['grams_left'])} · до {ua_date(r['expiry_date'])[:5]}", f"exp:wo:{r['id']}")] for r in rows[:10]]))
 
 
 @router.callback_query(F.data == "stock:low")
-async def stock_low(cb: CallbackQuery, db):
-    rows = [r for r in S.stock_summary(db, include_zero=True)
-            if (r["product"]["sale_mode"] == "piece" and r["product"]["piece_grams"] and r["grams"] < 3 * r["product"]["piece_grams"])
-            or (r["product"]["sale_mode"] == "weight" and r["grams"] < 500)]
+async def stock_low(cb: CallbackQuery, db, user):
+    rows = S.low_stock(db)
     txt = "⚠️ <b>Мало або немає</b> (менше 500 г / 3 шт)\n" + ("\n".join(
         f"• {r['product']['name']}: {fmt_grams(r['grams']) if r['grams'] else 'немає'}" for r in rows) if rows else "усього достатньо")
     await cb.message.answer(txt)
+    if rows and has_role(user, "manager"):
+        await cb.message.answer("Створити завдання «дозамовити»:", reply_markup=inline(
+            [[(f"📦 {r['product']['name'][:30]}", f"stock:order:{r['product']['id']}")] for r in rows[:10]] + [[("📦 Усі разом", "stock:order:all")]]))
     await cb.answer()
+
+
+@router.callback_query(F.data.startswith("stock:order:"))
+async def stock_order(cb: CallbackQuery, db, user):
+    if not has_role(user, "manager"):
+        return await cb.answer("Недостатньо прав", show_alert=True)
+    what = cb.data.split(":")[2]
+    if what == "all":
+        names = [f"{r['product']['name']} (є {fmt_grams(r['grams'])})" for r in S.low_stock(db)]
+        text = "Дозамовити: " + "; ".join(names)
+    else:
+        p = S.get_product(db, int(what))
+        text = f"Дозамовити {p['name']} (є {fmt_grams(S.stock_of_product(db, p['id']))})"
+    tid = S.create_task(db, user["telegram_id"], text[:500], None, None)
+    await cb.answer(f"Завдання №{tid} створено", show_alert=True)
+    for uid in S.notify_targets(db, "manager", actor_id=user["telegram_id"]):
+        if uid != user["telegram_id"]:
+            try:
+                await cb.bot.send_message(uid, f"📋 Нове завдання №{tid}: <b>{text}</b>", reply_markup=inline([[("✅ Виконано", f"task:done:{tid}")]]))
+            except Exception:
+                pass
 
 
 @router.message(StateFilter(None), F.text == M_OPENING)
@@ -125,24 +170,20 @@ async def stock_byprod(cb: CallbackQuery, db):
 # ======================= Партії =======================
 
 def batches_text(db, product_id: int) -> str:
+    from .adjustments import batches_table
     p = S.get_product(db, product_id)
     rows = S.batches_of_product(db, product_id)
     if not rows:
         return f"<b>{p['name']}</b>: відкритих партій немає."
-    out = [f"🏷 <b>{p['name']}</b> — партії (порядок FIFO):"]
-    for i, b in enumerate(rows, 1):
-        val = round_cents(Decimal(b["grams_left"]) * d(b["landed_price_per_kg"]) / 1000)
-        exp = f", до {ua_date(b['expiry_date'])}" if b["expiry_date"] else ""
-        extra = "" if d(b["landed_price_per_kg"]) == d(b["price_per_kg"]) else f" (собів. {fmt_price(b['landed_price_per_kg'])})"
-        out.append(f"{i}. #{b['id']} {b['batch_code'] or ''} від {ua_date(b['received_at'])}: <b>{fmt_grams(b['grams_left'])}</b> "
-                   f"з {fmt_grams(b['grams_in'])} · {fmt_price(b['price_per_kg'])} €/кг{extra} · {fmt_money(val)}{exp}")
-    return "\n".join(out)
+    total = sum((round_cents(Decimal(b["grams_left"]) * d(b["landed_price_per_kg"]) / 1000) for b in rows), Decimal(0))
+    return (f"🏷 <b>{p['name']}</b> — партії в порядку списання (FIFO), €/кг — собівартість з транспортом\n"
+            + batches_table(rows) + f"Разом: <b>{fmt_grams(sum(b['grams_left'] for b in rows))}</b> на <b>{fmt_money(total)}</b>")
 
 
 @router.message(F.text == M_BATCHES)
 async def batches(msg: Message, db, user, state: FSMContext):
     await state.clear()
-    await msg.answer("🏷 Партії — оберіть товар:", reply_markup=main_menu(user["role"]))
+    await msg.answer("🏷 Партії — оберіть товар:", reply_markup=menu_for(user))
     kb = product_picker(db, "bt", show_price=False)
     if has_role(user, "manager"):
         kb.inline_keyboard.append([InlineKeyboardButton(text="➕ Початковий залишок", callback_data="bt:opening")])
@@ -273,7 +314,7 @@ async def o_e(msg: Message, state: FSMContext, user, db):
     bid = S.add_opening_stock(db, user["telegram_id"], data["pid"], data["grams"], Decimal(data["price"]), exp)
     await state.clear()
     await msg.answer(f"✅ Партія #{bid}: {data['pname']} {fmt_grams(data['grams'])} по {fmt_price(data['price'])} €/кг додана.",
-                     reply_markup=main_menu(user["role"]))
+                     reply_markup=menu_for(user))
 
 
 # ======================= Товари =======================
@@ -282,18 +323,25 @@ MODE_UA = {"weight": "на вагу", "piece": "поштучно"}
 
 
 def product_card(p) -> str:
+    db = get_db()
+    stock_g = S.stock_of_product(db, p["id"])
+    s30 = S.product_sales_30d(db, p["id"])
     unit = "шт" if p["sale_mode"] == "piece" else "кг"
     pg = f" · упаковка {p['piece_grams']} г" if p["sale_mode"] == "piece" else ""
     st = "" if p["active"] else " · <i>архів</i>"
     sku = f" · арт. {p['sku']}" if p["sku"] else ""
     reg = f"\nЦіна каси Octobox: {fmt_price(p['register_price'])} €/кг" if p["register_price"] else ""
-    return f"<b>{p['name']}</b>{st}\n{S.CATEGORIES[p['category']]} · {MODE_UA[p['sale_mode']]}{pg}{sku}\nРоздрібна ціна: <b>{fmt_price(p['retail_price'])} €/{unit}</b>{reg}"
+    margin = f" · маржа {(s30['amount'] - s30['cost']) / s30['amount'] * 100:.0f} %" if s30["amount"] else ""
+    sales = (f"\n📈 За 30 днів: {fmt_grams(s30['grams'])} · {fmt_money(s30['amount'])} · {s30['checks']} чеків{margin}" if s30["checks"]
+             else "\n📈 За 30 днів продажів не було")
+    return (f"<b>{p['name']}</b>{st}\n{S.CATEGORIES[p['category']]} · {MODE_UA[p['sale_mode']]}{pg}{sku}\n"
+            f"Роздрібна ціна: <b>{fmt_price(p['retail_price'])} €/{unit}</b>{reg}\n📦 Залишок: <b>{fmt_grams(stock_g)}</b>{sales}")
 
 
 def product_kb(p):
     rows = [[("💶 Ціна", f"prod:price:{p['id']}"), ("🧾 Ціна каси/кг", f"prod:reg:{p['id']}"), ("✏️ Назва", f"prod:name:{p['id']}")],
             [("📦 Упаковка, г", f"prod:pg:{p['id']}"), ("🔢 Артикул", f"prod:sku:{p['id']}")],
-            [("🗄 В архів" if p["active"] else "♻️ Відновити", f"prod:toggle:{p['id']}")]]
+            [("🏷 Партії", f"pp:bt:id:{p['id']}"), ("🗄 В архів" if p["active"] else "♻️ Відновити", f"prod:toggle:{p['id']}")]]
     return inline(rows)
 
 
@@ -304,7 +352,7 @@ async def products(msg: Message, db, user, state: FSMContext):
     if has_role(user, "manager"):
         kb.inline_keyboard.append([InlineKeyboardButton(text="➕ Новий товар", callback_data="prod:new"),
                                    InlineKeyboardButton(text="🗄 Архів", callback_data="prod:archive")])
-    await msg.answer("🧀 <b>Товари</b> — оберіть для перегляду/редагування:", reply_markup=main_menu(user["role"]))
+    await msg.answer("🧀 <b>Товари</b> — оберіть для перегляду/редагування:", reply_markup=menu_for(user))
     await msg.answer("Товар:", reply_markup=kb)
 
 
@@ -436,7 +484,7 @@ async def p_sku(msg: Message, state: FSMContext, db, user):
     pid = S.create_product(db, data["name"], data["category"], data["mode"], Decimal(data["price"]),
                            data.get("piece_grams"), sku)
     await state.clear()
-    await msg.answer("✅ Товар створено.\n" + product_card(S.get_product(db, pid)), reply_markup=main_menu(user["role"]))
+    await msg.answer("✅ Товар створено.\n" + product_card(S.get_product(db, pid)), reply_markup=menu_for(user))
 
 
 # --- редагування полів картки ---
@@ -487,4 +535,4 @@ async def prod_edit_value(msg: Message, state: FSMContext, db, user):
     except Exception as e:
         return await msg.answer(f"⚠️ Не вдалося зберегти: {e}")
     await state.clear()
-    await msg.answer("✅ Збережено.\n" + product_card(S.get_product(db, pid)), reply_markup=main_menu(user["role"]))
+    await msg.answer("✅ Збережено.\n" + product_card(S.get_product(db, pid)), reply_markup=menu_for(user))

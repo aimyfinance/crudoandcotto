@@ -11,7 +11,7 @@ from aiogram.types import CallbackQuery, Message
 
 from .. import services as S
 from ..db import get_db, today_local
-from ..keyboards import BACK, M_PURCHASE, M_PURCH_CANCEL, M_PURCH_MANUAL, M_INVOICE, SKIP, TODAY, inline, main_menu, nav_kb, product_picker
+from ..keyboards import menu_for, BACK, M_PURCHASE, M_PURCH_CANCEL, M_PURCH_MANUAL, M_INVOICE, SKIP, TODAY, inline, main_menu, nav_kb, product_picker
 from ..money import ParseError, fmt_grams, fmt_money, fmt_price, line_amount, parse_money, parse_weight_grams
 from .common import Flow, has_role, parse_date, ua_date
 
@@ -123,7 +123,7 @@ async def recent(msg: Message, db, user):
     if not rows:
         return await msg.answer("Закупівель ще немає.")
     await msg.answer("📦 <b>Останні закупівлі</b>\n" + "\n".join(
-        f"№{p['id']} {ua_date(p['doc_date'])} {p['supplier_name'] or ''} — {p['status']}" + (f" · {p['comment']}" if p["comment"] else "") for p in rows))
+        f"№{p['id']} {ua_date(p['doc_date'])} {p['supplier_name'] or ''} — {S.STATUS_UA.get(p['status'], p['status'])}" + (f" · {p['comment']}" if p["comment"] else "") for p in rows))
 
 
 @router.message(StateFilter(None), F.text == M_PURCH_CANCEL)
@@ -325,7 +325,10 @@ async def confirm(cb: CallbackQuery, state: FSMContext, user, db):
     except Exception:
         pass
     await cb.message.answer(f"✅ Закупівлю №{pid} проведено, залишки збільшено ({len(lines)} партій).",
-                            reply_markup=main_menu(user["role"]))
+                            reply_markup=menu_for(user))
+    cmp = price_comparison(db, pid)
+    if cmp:
+        await cb.message.answer(cmp)
     await cb.answer()
 
 
@@ -556,6 +559,24 @@ async def inv_transport_val(msg: Message, state: FSMContext):
     await _inv_review(msg, state)
 
 
+def price_comparison(db, purchase_id: int) -> str:
+    """Ціни цієї закупівлі проти попередньої партії кожного товару (>5 % — позначаємо)."""
+    rows = []
+    for b in db.q("SELECT b.*, p.name FROM batches b JOIN products p ON p.id=b.product_id WHERE b.purchase_id=?", (purchase_id,)):
+        prev = S.previous_batch_price(db, b["product_id"], purchase_id)
+        if not prev:
+            rows.append((b["name"], fmt_price(b["price_per_kg"]), "перша закупівля"))
+            continue
+        old, new = Decimal(prev["price_per_kg"]), Decimal(b["price_per_kg"])
+        diff = (new - old) / old * 100 if old else Decimal(0)
+        mark = "🔺" if diff > 5 else "🔻" if diff < -5 else "="
+        rows.append((b["name"], fmt_price(new.quantize(Decimal("0.01"))), f"{mark} {diff:+.0f}% (було {fmt_price(old.quantize(Decimal('0.01')))})"))
+    if not rows:
+        return ""
+    lines = [f"{n[:20]:<20} {p:>7} {c}" for n, p, c in rows]
+    return "💶 <b>Ціни vs попередня закупівля</b>, €/кг\n<pre>" + "\n".join(lines) + "</pre>"
+
+
 @router.callback_query(StateFilter(Inv.review), F.data == "inv:post")
 async def inv_post(cb: CallbackQuery, state: FSMContext, db, user):
     from ..invoice import post_draft
@@ -577,5 +598,8 @@ async def inv_post(cb: CallbackQuery, state: FSMContext, db, user):
     await state.clear()
     await cb.message.answer(f"✅ Закупівлю №{pid} оприбутковано: {n} партій" + (f", пропущено {skipped} поз." if skipped else "") +
                             ". Прив'язки назв постачальника збережено — наступний інвойс розпізнається без правок.",
-                            reply_markup=main_menu(user["role"]))
+                            reply_markup=menu_for(user))
+    cmp = price_comparison(db, pid)
+    if cmp:
+        await cb.message.answer(cmp)
     await cb.answer()

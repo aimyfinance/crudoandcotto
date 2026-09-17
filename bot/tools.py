@@ -470,7 +470,7 @@ def _resolve_line(db, l: dict, cache: dict, st: dict, day: str, number: str, pla
         st.setdefault("free_skipped", 0)
         st["free_skipped"] += 1          # позиція за 0 € без ваги (подарунок/100 % знижка) — не впливає на виручку
         return None
-    if prod["sale_mode"] == "piece" or grams <= 0:
+    if grams <= 0:   # вага відома (з експорту/ціни) — використовуємо її навіть для «штучних» у боті товарів
         pg = prod["piece_grams"] or 0
         if pg <= 0:
             st["unmatched"][l["name"] + " (немає ваги: задайте ціну каси за кг у картці товару)"] = 1

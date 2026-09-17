@@ -8,8 +8,10 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
 from .. import services as S
+import datetime as dt
+
 from ..db import get_db, local_dt_str, today_local
-from ..keyboards import BACK, M_HISTORY, M_WRITEOFF, inline, main_menu, nav_kb, product_picker
+from ..keyboards import menu_for, BACK, M_HISTORY, M_LOG, M_WRITEOFF, inline, main_menu, nav_kb, product_picker
 from ..money import ParseError, fmt_grams, fmt_money, fmt_price, parse_weight_grams, d
 from .common import Flow, has_role, ua_date
 
@@ -45,7 +47,7 @@ async def menu(msg: Message, state: FSMContext, user):
     if not has_role(user, "manager"):
         return await msg.answer("Списання і коригування доступні менеджеру й адміністратору.")
     await state.clear()
-    await msg.answer("✂️ <b>Списання / коригування</b>", reply_markup=main_menu(user["role"]))
+    await msg.answer("✂️ <b>Списання / коригування</b>", reply_markup=menu_for(user))
     await msg.answer("Оберіть дію:", reply_markup=inline([
         [("✂️ Списати з причиною", "wo:start")],
         [("📋 Інвентаризація (факт. залишок партії)", "inv:start")],
@@ -62,8 +64,28 @@ async def w_product(msg, state):
 
 async def w_weight(msg, state):
     data = await state.get_data()
-    have = S.stock_of_product(get_db(), data["pid"])
-    await msg.answer(f"<b>{data['pname']}</b>, залишок {fmt_grams(have)}.\nВага списання (г або кг):", reply_markup=nav_kb())
+    db = get_db()
+    have = S.stock_of_product(db, data["pid"])
+    rows = S.batches_of_product(db, data["pid"])
+    txt = f"<b>{data['pname']}</b>, залишок {fmt_grams(have)}\n"
+    txt += batches_table(rows)
+    txt += "\nВведіть вагу списання (г або кг) або оберіть партію, щоб списати її цілком:"
+    await msg.answer(txt, reply_markup=nav_kb())
+    if rows:
+        await msg.answer("Списати цілу партію:", reply_markup=inline(
+            [[(f"✂️ #{b['id']} {fmt_grams(b['grams_left'])}" + (f" · до {ua_date(b['expiry_date'])}" if b["expiry_date"] else ""), f"wo:batch:{b['id']}")] for b in rows[:8]]))
+
+
+def batches_table(rows) -> str:
+    """Партії у вигляді моноширинної таблиці: # · дата · залишок · €/кг · термін."""
+    if not rows:
+        return "<i>відкритих партій немає</i>"
+    lines = ["  #   дата      залишок    €/кг  термін"]
+    for b in rows:
+        exp = ua_date(b["expiry_date"])[:5] if b["expiry_date"] else "  —  "
+        warn = "⏰" if b["expiry_date"] and b["expiry_date"] <= (dt.date.today() + dt.timedelta(days=7)).isoformat() else " "
+        lines.append(f"{b['id']:>4} {ua_date(b['received_at'])[:5]}  {fmt_grams(b['grams_left']):>9}  {str(f"{float(b['landed_price_per_kg']):.2f}").replace('.', ',')}  {exp}{warn}")
+    return "<pre>" + "\n".join(lines) + "</pre>"
 
 
 async def w_reason(msg, state):
@@ -77,7 +99,8 @@ async def w_reason_text(msg, state):
 
 async def w_confirm(msg, state):
     data = await state.get_data()
-    await msg.answer(f"Списати <b>{data['pname']}</b> — {fmt_grams(data['grams'])}\nПричина: {data['reason']}\n(партія — FIFO)",
+    src = f"партія #{data['batch_id']}" if data.get("batch_id") else "партія — FIFO"
+    await msg.answer(f"Списати <b>{data['pname']}</b> — {fmt_grams(data['grams'])}\nПричина: {data['reason']}\n({src})",
                      reply_markup=nav_kb())
     await msg.answer("Підтвердити?", reply_markup=inline([[("✅ Списати", "wo:confirm")]]))
 
@@ -114,6 +137,16 @@ async def wo_pick(cb: CallbackQuery, state: FSMContext, db):
     await wflow.goto(cb.message, state, WO.weight)
 
 
+@router.callback_query(StateFilter(WO.weight), F.data.startswith("wo:batch:"))
+async def wo_batch_whole(cb: CallbackQuery, state: FSMContext, db):
+    b = db.one("SELECT * FROM batches WHERE id=?", (int(cb.data.split(":")[2]),))
+    if not b or b["grams_left"] <= 0:
+        return await cb.answer("Партія порожня", show_alert=True)
+    await state.update_data(grams=b["grams_left"], batch_id=b["id"])
+    await cb.answer()
+    await wflow.goto(cb.message, state, WO.reason)
+
+
 @router.message(StateFilter(WO.weight), F.text)
 async def wo_weight(msg: Message, state: FSMContext, db):
     try:
@@ -124,7 +157,7 @@ async def wo_weight(msg: Message, state: FSMContext, db):
     have = S.stock_of_product(db, data["pid"])
     if g > have:
         return await msg.answer(f"⚠️ Залишок лише {fmt_grams(have)}")
-    await state.update_data(grams=g)
+    await state.update_data(grams=g, batch_id=None)
     await wflow.goto(msg, state, WO.reason)
 
 
@@ -148,12 +181,12 @@ async def wo_reason_text(msg: Message, state: FSMContext):
 async def wo_confirm(cb: CallbackQuery, state: FSMContext, db, user):
     data = await state.get_data()
     try:
-        wid = S.write_off(db, user["telegram_id"], data["pid"], data["grams"], data["reason"])
+        wid = S.write_off(db, user["telegram_id"], data["pid"], data["grams"], data["reason"], batch_id=data.get("batch_id"))
     except S.StockError as e:
         return await cb.answer(str(e), show_alert=True)
     await state.clear()
     await cb.message.answer(f"✅ Списання №{wid}: {data['pname']} {fmt_grams(data['grams'])} — {data['reason']}",
-                            reply_markup=main_menu(user["role"]))
+                            reply_markup=menu_for(user))
     await cb.answer()
 
 
@@ -171,7 +204,7 @@ async def i_batch(msg, state):
         await msg.answer("Відкритих партій немає. Для дооприбуткування скористайтесь «Партії → Початковий залишок».",
                          reply_markup=nav_kb())
         return
-    await msg.answer("Оберіть партію:", reply_markup=nav_kb())
+    await msg.answer("Оберіть партію:\n" + batches_table(rows), reply_markup=nav_kb())
     await msg.answer("Партія:", reply_markup=inline([
         [(f"#{b['id']} {b['batch_code'] or ''} від {ua_date(b['received_at'])} — {fmt_grams(b['grams_left'])}", f"inv:b:{b['id']}")]
         for b in rows]))
@@ -253,7 +286,7 @@ async def inv_reason(msg: Message, state: FSMContext, db, user):
         return await msg.answer(f"⚠️ {e}")
     await state.clear()
     await msg.answer(f"✅ Коригування №{wid} проведено: партія #{data['bid']} → {fmt_grams(data['actual'])}.",
-                     reply_markup=main_menu(user["role"]))
+                     reply_markup=menu_for(user))
 
 
 # ---------------- скасування операцій ----------------
@@ -317,9 +350,9 @@ async def cx_reason(msg: Message, state: FSMContext, db, user):
             S.cancel_purchase(db, data["cx_id"], user["telegram_id"], reason)
     except (S.StockError, ValueError) as e:
         await state.clear()
-        return await msg.answer(f"⚠️ {e}", reply_markup=main_menu(user["role"]))
+        return await msg.answer(f"⚠️ {e}", reply_markup=menu_for(user))
     await state.clear()
-    await msg.answer(f"✅ Операцію №{data['cx_id']} скасовано, залишки відновлено.", reply_markup=main_menu(user["role"]))
+    await msg.answer(f"✅ Операцію №{data['cx_id']} скасовано, залишки відновлено.", reply_markup=menu_for(user))
 
 
 # ---------------- історія ----------------
@@ -343,8 +376,8 @@ async def history(msg: Message, db, user, state: FSMContext):
         purs = S.recent_purchases(db, 5)
         if purs:
             txt += "\n\n<b>Закупівлі</b>\n" + "\n".join(
-                f"№{p['id']} {ua_date(p['doc_date'])} {p['supplier_name'] or ''} — {p['status']}" for p in purs)
-    await msg.answer(txt, reply_markup=main_menu(user["role"]))
+                f"№{p['id']} {ua_date(p['doc_date'])} {p['supplier_name'] or ''} — {S.STATUS_UA.get(p['status'], p['status'])}" for p in purs)
+    await msg.answer(txt, reply_markup=menu_for(user))
     if sales:
         await msg.answer("Деталі продажу:", reply_markup=inline(
             [[(f"№{s['id']} {fmt_money(s['total'])}", f"hist:sale:{s['id']}") for s in sales[i:i + 3]] for i in range(0, min(len(sales), 9), 3)]
@@ -365,4 +398,52 @@ async def hist_sale(cb: CallbackQuery, db):
     if s["status"] == "cancelled":
         txt.append(f"❌ Скасовано: {s['cancel_reason']}")
     await cb.message.answer("\n".join(txt))
+    await cb.answer()
+
+
+# ---------------- журнал дій ----------------
+
+@router.message(StateFilter(None), F.text == M_LOG)
+async def action_log(msg: Message, db, user):
+    if not has_role(user, "manager"):
+        return
+    rows = S.audit_recent(db, 15, None if user["role"] == "admin" else None)
+    if user["role"] == "manager":   # менеджер не бачить дій адміністратора
+        admins = {u["telegram_id"] for u in S.list_users(db) if u["role"] == "admin"}
+        rows = [r for r in rows if r["user_id"] not in admins]
+    if not rows:
+        return await msg.answer("Журнал порожній.")
+    txt = ["🕘 <b>Журнал дій</b> (останні)"]
+    kb = []
+    for r in rows:
+        who = r["user_name"] or r["user_id"]
+        txt.append(f"<b>#{r['id']}</b> {local_dt_str(r['ts'])} · {who}\n     {S.audit_describe(db, r)}")
+        if r["action"] in S.UNDOABLE:
+            kb.append((f"↩️ #{r['id']}", f"undo:ask:{r['id']}"))
+    await msg.answer("\n".join(txt))
+    if kb:
+        await msg.answer("Повернути дію (буде запитано підтвердження):", reply_markup=inline([kb[i:i + 4] for i in range(0, len(kb), 4)]))
+
+
+@router.callback_query(F.data.startswith("undo:ask:"))
+async def undo_ask(cb: CallbackQuery, db, user):
+    if not has_role(user, "manager"):
+        return await cb.answer("Недостатньо прав", show_alert=True)
+    aid = int(cb.data.split(":")[2])
+    r = db.one("SELECT * FROM audit_log WHERE id=?", (aid,))
+    if not r:
+        return await cb.answer("Не знайдено", show_alert=True)
+    await cb.message.answer(f"Повернути дію #{aid}?\n{S.audit_describe(db, r)}", reply_markup=inline([[("↩️ Так, повернути", f"undo:yes:{aid}"), ("Ні", "noop")]]))
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("undo:yes:"))
+async def undo_yes(cb: CallbackQuery, db, user):
+    if not has_role(user, "manager"):
+        return await cb.answer("Недостатньо прав", show_alert=True)
+    try:
+        res = S.undo_action(db, int(cb.data.split(":")[2]), user["telegram_id"])
+    except (S.StockError, S.DuplicateOperation, ValueError) as e:
+        return await cb.answer(str(e), show_alert=True)
+    await cb.message.answer(f"✅ {res}")
     await cb.answer()

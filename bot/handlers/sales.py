@@ -12,7 +12,7 @@ from aiogram.types import CallbackQuery, Message
 
 from .. import services as S
 from ..db import get_db
-from ..keyboards import BACK, M_SALE, inline, main_menu, nav_kb, product_picker
+from ..keyboards import menu_for, BACK, M_SALE, inline, main_menu, nav_kb, product_picker
 from ..money import ParseError, fmt_grams, fmt_money, fmt_price, line_amount, parse_money, parse_weight_grams, piece_amount, d
 from .common import Flow, cancel_to_menu
 
@@ -277,7 +277,7 @@ async def confirm_sale(cb: CallbackQuery, state: FSMContext, user, db):
         res = S.create_sale(db, user["telegram_id"], lines, method, client_key=f"sale:{key}")
     except S.DuplicateOperation as e:
         await state.clear()
-        await cb.message.answer(f"ℹ️ {e}", reply_markup=main_menu(user["role"]))
+        await cb.message.answer(f"ℹ️ {e}", reply_markup=menu_for(user))
         return await cb.answer()
     except S.InsufficientStock as e:
         return await cb.answer(str(e), show_alert=True)
@@ -289,6 +289,6 @@ async def confirm_sale(cb: CallbackQuery, state: FSMContext, user, db):
     await cb.message.answer(
         f"✅ Продаж №{res.sale_id} проведено — <b>{fmt_money(res.total)}</b> ({S.PAYMENTS[method]})\n"
         "Це внутрішній запис, не фіскальний чек.",
-        reply_markup=main_menu(user["role"]),
+        reply_markup=menu_for(user),
     )
     await cb.answer()

@@ -20,6 +20,7 @@ from .money import ZERO, d, round_cents, line_amount, piece_amount, PRICE_PREC
 CATEGORIES = {"cheese": "Сир", "meat": "М'ясні вироби", "pasta": "Паста / напівфабрикати"}
 PAYMENTS = {"cash": "Готівка", "card": "Картка", "other": "Інше"}
 ROLES = {"admin": "Адміністратор", "manager": "Менеджер", "seller": "Продавець"}
+STATUS_UA = {"received": "проведено", "draft": "чернетка", "cancelled": "скасовано", "done": "проведено"}
 
 
 class StockError(Exception):
@@ -1108,3 +1109,211 @@ def visible_sales(db: Database, user, limit: int = 15, date: str | None = None):
     sql += " ORDER BY s.id DESC LIMIT ?"
     p.append(limit)
     return db.q(sql, p)
+
+
+# ======================= журнал дій і відкат =======================
+
+ACTION_UA = {
+    "sale.create": "🛒 Продаж створено", "sale.cancel": "🛒 Продаж скасовано", "sale.add_lines": "🛒 Продаж доповнено",
+    "purchase.create": "📦 Закупівлю створено", "purchase.receive": "📦 Закупівлю оприбутковано", "purchase.cancel": "📦 Закупівлю скасовано",
+    "stock.opening": "🏷 Початковий залишок", "batch.remove": "🏷 Партію видалено",
+    "writeoff.create": "✂️ Списання", "adjustment.create": "📋 Інвентаризація", "writeoff.cancel": "✂️ Списання скасовано",
+    "expense.create": "💸 Витрату додано", "expense.cancel": "💸 Витрату видалено", "expense.restore": "💸 Витрату відновлено",
+    "expense.update": "💸 Витрату змінено",
+    "task.create": "📋 Завдання створено", "task.done": "📋 Завдання виконано",
+    "shift.open": "▶️ Зміну відкрито", "shift.close": "⏹ Зміну закрито", "db.reset": "🧹 Базу очищено",
+}
+UNDOABLE = {"sale.create", "sale.cancel", "purchase.receive", "purchase.cancel", "batch.remove", "writeoff.create",
+            "adjustment.create", "expense.create", "expense.cancel", "task.done", "task.create"}
+
+
+def audit_recent(db: Database, limit: int = 20, user_id: int | None = None):
+    sql = "SELECT a.*, u.name AS user_name FROM audit_log a LEFT JOIN users u ON u.telegram_id=a.user_id"
+    p: list = []
+    if user_id is not None:
+        sql += " WHERE a.user_id=?"
+        p.append(user_id)
+    return db.q(sql + " ORDER BY a.id DESC LIMIT ?", p + [limit])
+
+
+def audit_describe(db: Database, row) -> str:
+    """Людський опис запису журналу з назвами об'єктів."""
+    det = json.loads(row["details"]) if row["details"] else {}
+    a = row["action"]
+    label = ACTION_UA.get(a, a)
+    extra = ""
+    try:
+        if a.startswith("sale"):
+            s = db.one("SELECT total, sale_date FROM sales WHERE id=?", (det.get("sale_id"),))
+            extra = f" №{det.get('sale_id')} на {s['total']} €" if s else f" №{det.get('sale_id')}"
+        elif a.startswith("purchase"):
+            p = db.one("SELECT pu.doc_date, s.name FROM purchases pu LEFT JOIN suppliers s ON s.id=pu.supplier_id WHERE pu.id=?", (det.get("purchase_id"),))
+            extra = f" №{det.get('purchase_id')} {p['name'] or ''} {p['doc_date']}" if p else f" №{det.get('purchase_id')}"
+        elif a.startswith("expense"):
+            e = db.one("SELECT category, amount, op_date FROM expenses WHERE id=?", (det.get("expense_id"),))
+            extra = f" №{det.get('expense_id')}: {e['category']} {e['amount']} € ({e['op_date']})" if e else f" №{det.get('expense_id')}"
+        elif a in ("writeoff.create", "adjustment.create", "writeoff.cancel"):
+            w = db.one("SELECT w.grams_delta, w.reason, p.name FROM writeoffs w JOIN products p ON p.id=w.product_id WHERE w.id=?", (det.get("writeoff_id"),))
+            extra = f" №{det.get('writeoff_id')}: {w['name']} {w['grams_delta']:+d} г ({w['reason']})" if w else ""
+        elif a == "batch.remove" or a == "stock.opening":
+            b = db.one("SELECT b.grams_in, p.name FROM batches b JOIN products p ON p.id=b.product_id WHERE b.id=?", (det.get("batch_id"),))
+            extra = f" #{det.get('batch_id')}: {b['name']}" if b else f" #{det.get('batch_id')}"
+        elif a.startswith("task"):
+            t = db.one("SELECT text FROM tasks WHERE id=?", (det.get("task_id"),))
+            extra = f" №{det.get('task_id')}: {t['text'][:40]}" if t else ""
+    except Exception:
+        pass
+    return label + extra
+
+
+def undo_action(db: Database, audit_id: int, user_id: int) -> str:
+    """Відкат дії з журналу. Повертає повідомлення. Кидає StockError/ValueError, якщо неможливо."""
+    row = db.one("SELECT * FROM audit_log WHERE id=?", (audit_id,))
+    if not row:
+        raise ValueError("Запис журналу не знайдено")
+    det = json.loads(row["details"]) if row["details"] else {}
+    a = row["action"]
+    if a not in UNDOABLE:
+        raise ValueError("Цю дію не можна повернути автоматично")
+    if a == "sale.create":
+        cancel_sale(db, det["sale_id"], user_id, f"відкат дії №{audit_id}")
+        return f"Продаж №{det['sale_id']} скасовано, залишки відновлено"
+    if a == "sale.cancel":
+        new_id = restore_sale(db, det["sale_id"], user_id)
+        return f"Продаж відновлено як №{new_id}"
+    if a == "purchase.receive":
+        cancel_purchase(db, det["purchase_id"], user_id, f"відкат дії №{audit_id}")
+        delete_documents_for(db, "purchase", det["purchase_id"])
+        return f"Закупівлю №{det['purchase_id']} скасовано"
+    if a == "purchase.cancel":
+        restore_purchase(db, det["purchase_id"], user_id)
+        return f"Закупівлю №{det['purchase_id']} відновлено, партії повернуто на склад"
+    if a == "batch.remove":
+        restore_batch(db, det["batch_id"], user_id)
+        return f"Партію #{det['batch_id']} повернуто на склад"
+    if a in ("writeoff.create", "adjustment.create"):
+        cancel_writeoff(db, det["writeoff_id"], user_id, f"відкат дії №{audit_id}")
+        return f"Операцію №{det['writeoff_id']} скасовано"
+    if a == "expense.create":
+        cancel_expense(db, det["expense_id"], user_id)
+        return f"Витрату №{det['expense_id']} видалено"
+    if a == "expense.cancel":
+        restore_expense(db, det["expense_id"], user_id)
+        return f"Витрату №{det['expense_id']} відновлено"
+    if a == "task.done":
+        with db.tx() as c:
+            c.execute("UPDATE tasks SET status='open', done_at=NULL, done_by=NULL WHERE id=?", (det["task_id"],))
+        return f"Завдання №{det['task_id']} знову відкрите"
+    if a == "task.create":
+        task_cancel(db, det["task_id"], user_id)
+        return f"Завдання №{det['task_id']} скасовано"
+    raise ValueError("Невідома дія")
+
+
+def restore_sale(db: Database, sale_id: int, user_id: int) -> int:
+    """Повторно проводить скасований продаж (новим документом, тим самим часом і позиціями)."""
+    s, lines = get_sale(db, sale_id)
+    if not s or s["status"] != "cancelled":
+        raise ValueError("Продаж не скасований")
+    new_lines = [SaleLine(l["product_id"], l["grams"], d(l["price"]), l["pieces"]) for l in lines]
+    res = create_sale(db, user_id, new_lines, s["payment_method"], comment=f"відновлено з №{sale_id}", sold_at=s["sold_at"])
+    return res.sale_id
+
+
+def restore_purchase(db: Database, purchase_id: int, user_id: int) -> None:
+    ts = now_utc()
+    with db.tx() as c:
+        p = c.execute("SELECT * FROM purchases WHERE id=?", (purchase_id,)).fetchone()
+        if not p or p["status"] != "cancelled":
+            raise ValueError("Закупівля не скасована")
+        for b in c.execute("SELECT * FROM batches WHERE purchase_id=?", (purchase_id,)).fetchall():
+            if b["grams_left"] != 0:
+                raise StockError("Партії закупівлі вже мають залишок — відновлення неможливе")
+            c.execute("UPDATE batches SET grams_left=grams_in WHERE id=?", (b["id"],))
+            _movement(c, ts, b["product_id"], b["id"], b["grams_in"], round_cents(Decimal(b["grams_in"]) * d(b["landed_price_per_kg"]) / 1000),
+                      "purchase", "purchase", purchase_id, user_id)
+        c.execute("UPDATE purchases SET status='received', cancelled_at=NULL, cancelled_by=NULL, cancel_reason=NULL WHERE id=?", (purchase_id,))
+        audit(c, user_id, "purchase.receive", {"purchase_id": purchase_id, "restored": True})
+
+
+def restore_batch(db: Database, batch_id: int, user_id: int) -> None:
+    ts = now_utc()
+    with db.tx() as c:
+        b = c.execute("SELECT * FROM batches WHERE id=?", (batch_id,)).fetchone()
+        if not b or b["grams_in"] != 0:
+            raise ValueError("Партія не видалена")
+        m = c.execute("SELECT grams_delta FROM stock_movements WHERE batch_id=? AND kind IN ('purchase','opening') ORDER BY id LIMIT 1", (batch_id,)).fetchone()
+        if not m:
+            raise ValueError("Немає даних про прихід партії")
+        g = m["grams_delta"]
+        c.execute("UPDATE batches SET grams_in=?, grams_left=? WHERE id=?", (g, g, batch_id))
+        _movement(c, ts, b["product_id"], batch_id, g, round_cents(Decimal(g) * d(b["landed_price_per_kg"]) / 1000), "purchase", "batch", batch_id, user_id)
+        audit(c, user_id, "stock.opening", {"batch_id": batch_id, "restored": True})
+
+
+# ======================= висновки / підказки =======================
+
+def stale_products(db: Database, days: int = 14):
+    """Товари із залишком, що не продавались N днів (або взагалі)."""
+    since = (dt_date_today() - __import__("datetime").timedelta(days=days)).isoformat()
+    rows = db.q(
+        "SELECT p.id, p.name, COALESCE(SUM(b.grams_left),0) AS grams, "
+        "(SELECT MAX(s.sale_date) FROM sale_lines sl JOIN sales s ON s.id=sl.sale_id WHERE sl.product_id=p.id AND s.status='done') AS last_sale "
+        "FROM products p JOIN batches b ON b.product_id=p.id AND b.grams_left>0 WHERE p.active=1 GROUP BY p.id")
+    return [r for r in rows if r["grams"] > 0 and (r["last_sale"] is None or r["last_sale"] < since)]
+
+
+def low_stock(db: Database):
+    """Мало або немає — лише товари, що є в обороті (залишок > 0 або продавались за 30 днів)."""
+    since = (dt_date_today() - __import__("datetime").timedelta(days=30)).isoformat()
+    active = {r["product_id"] for r in db.q(
+        "SELECT DISTINCT sl.product_id FROM sale_lines sl JOIN sales s ON s.id=sl.sale_id WHERE s.status='done' AND s.sale_date>=?", (since,))}
+    out = []
+    for r in stock_summary(db, include_zero=True):
+        p = r["product"]
+        if r["grams"] <= 0 and p["id"] not in active:
+            continue
+        if p["sale_mode"] == "piece" and p["piece_grams"]:
+            if r["grams"] < 3 * p["piece_grams"]:
+                out.append(r)
+        elif r["grams"] < 500:
+            out.append(r)
+    return out
+
+
+def previous_batch_price(db: Database, product_id: int, before_purchase_id: int):
+    r = db.one("SELECT price_per_kg, received_at FROM batches WHERE product_id=? AND source='purchase' AND purchase_id<>? "
+               "AND grams_in>0 ORDER BY received_at DESC, id DESC LIMIT 1", (product_id, before_purchase_id))
+    return r
+
+
+def product_sales_30d(db: Database, product_id: int) -> dict:
+    since = (dt_date_today() - __import__("datetime").timedelta(days=30)).isoformat()
+    r = db.one("SELECT COALESCE(SUM(sl.grams),0) g, COALESCE(SUM(CAST(sl.amount AS REAL)),0) a, COALESCE(SUM(CAST(sl.cost AS REAL)),0) c, COUNT(DISTINCT s.id) n "
+               "FROM sale_lines sl JOIN sales s ON s.id=sl.sale_id WHERE sl.product_id=? AND s.status='done' AND s.sale_date>=?", (product_id, since))
+    return {"grams": int(r["g"]), "amount": Decimal(str(round(r["a"], 2))), "cost": Decimal(str(round(r["c"], 2))), "checks": r["n"]}
+
+
+def conclusions(db: Database, rep: dict) -> list[str]:
+    """3–4 висновки словами до звіту."""
+    out = []
+    bp = rep["by_product"]
+    if bp:
+        top = bp[0]
+        out.append(f"🏆 Найбільше виручки дав {top['name']}: {top['amount']:.0f} € ({top['grams'] / 1000:.1f} кг).")
+        sold_enough = [e for e in bp if e["amount"] >= 20]
+        if sold_enough:
+            worst = min(sold_enough, key=lambda e: e["margin_pct"])
+            if worst["margin_pct"] < 45:
+                out.append(f"📉 Найнижча маржа — {worst['name']}: {worst['margin_pct']:.0f} %. Перевірте ціну або закупівлю.")
+    stale = stale_products(db, 14)
+    if stale:
+        names = ", ".join(f"{r['name']} ({r['grams'] / 1000:.1f} кг)" for r in sorted(stale, key=lambda r: -r["grams"])[:4])
+        out.append(f"🧊 Не продавались понад 14 днів: {names}.")
+    low = low_stock(db)
+    if low:
+        out.append("📦 Закінчується: " + ", ".join(r["product"]["name"] for r in low[:5]) + ".")
+    exp = batches_expiring(db, 3)
+    if exp:
+        out.append("⏰ Спливає за 3 дні: " + ", ".join(f"{r['product_name']} до {r['expiry_date'][8:10]}.{r['expiry_date'][5:7]}" for r in exp[:4]) + ".")
+    return out
