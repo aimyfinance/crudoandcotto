@@ -561,14 +561,16 @@ async def rep_cb(cb: CallbackQuery, state: FSMContext, db, user):
             await cb.message.answer("За період немає ні продажів, ні даних каси.")
         else:
             txt = ["🧾 <b>Звірка бот ↔ каса</b>"]
+            m = lambda v: f"{v:,.2f}".replace(",", " ").replace(".", ",")
+            txt.append("дата       бот      каса   різниця")
             for r in rows:
                 if r["reg_total"] is None:
-                    txt.append(f"{ua_date(r['day'])[:5]}  бот {fmt_money(r['bot_total']):>11}  каса —")
+                    txt.append(f"{ua_date(r['day'])[:5]} {m(r['bot_total']):>9}         —")
                 else:
                     flag = "✅" if r["diff"] == 0 else "⚠️"
-                    txt.append(f"{ua_date(r['day'])[:5]}  бот {fmt_money(r['bot_total']):>11}  каса {fmt_money(r['reg_total']):>11}  {fmt_money(r['diff']):>9} {flag}")
+                    txt.append(f"{ua_date(r['day'])[:5]} {m(r['bot_total']):>9} {m(r['reg_total']):>9} {m(r['diff']):>8}{flag}")
             tot_b = sum((r["bot_total"] for r in rows), Decimal(0)); tot_r = sum((r["reg_total"] or Decimal(0) for r in rows), Decimal(0))
-            txt.append(f"Разом  бот {fmt_money(tot_b):>11}  каса {fmt_money(tot_r):>11}  {fmt_money(tot_b - tot_r):>9}")
+            txt.append(f"Разом {m(tot_b):>9} {m(tot_r):>9} {m(tot_b - tot_r):>8}")
             await cb.message.answer(txt[0] + "\n<pre>" + "\n".join(txt[1:]) + "</pre>\n<i>Каса — з бек-офісу Octobox (онлайн) або з імпортованої виписки.</i>")
         try:
             await cb.answer()

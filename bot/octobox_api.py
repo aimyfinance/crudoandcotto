@@ -248,7 +248,7 @@ def _receipt_from_order(o: dict, lines: list[dict], payments: list[dict], weight
             if not grams:
                 gross = amount
                 disc = Decimal(str(l.get("discount") or 0))
-                if disc:
+                if 0 < disc < 100:
                     gross = amount / (1 - disc / 100)   # сума до знижки — щоб ділити на ціну за кг
                 per_kg = None
                 pu = Decimal(str(l.get("price_unit") or 0))

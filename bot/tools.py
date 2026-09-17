@@ -357,7 +357,10 @@ def learn_register_prices(receipts: list[dict], user_id: int) -> dict[str, Decim
                 pid = S.match_product(db, l["name"])[0]
                 if not pid:
                     continue
-                gross = l["amount"] / (1 - (l.get("discount") or Decimal(0)) / 100)
+                disc = l.get("discount") or Decimal(0)
+                if disc >= 100:
+                    continue
+                gross = l["amount"] / (1 - disc / 100)
                 per.setdefault(pid, []).append(gross * 1000 / Decimal(l["grams"]))
     learned = {}
     for pid, vals in per.items():
@@ -462,8 +465,9 @@ def _resolve_line(db, l: dict, cache: dict, st: dict, day: str, number: str, pla
     grams, pieces = l["grams"], None
     if prod["sale_mode"] == "weight" and grams <= 0:
         per_kg = Decimal(prod["register_price"] or 0) or Decimal(prod["retail_price"] or 0)
-        if per_kg > 0 and l["amount"] > 0:
-            gross = l["amount"] / (1 - (l.get("discount") or Decimal(0)) / 100)
+        disc = l.get("discount") or Decimal(0)
+        if per_kg > 0 and l["amount"] > 0 and disc < 100:
+            gross = l["amount"] / (1 - disc / 100)
             grams = int((gross * 1000 / per_kg).quantize(Decimal("1")))
             l["grams"] = grams
     if prod["sale_mode"] == "weight" and grams <= 0 and l["amount"] <= 0:
