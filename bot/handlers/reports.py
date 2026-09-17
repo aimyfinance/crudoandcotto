@@ -546,8 +546,8 @@ async def exp_list(cb: CallbackQuery, db, user):
 async def exp_del(cb: CallbackQuery, db, user):
     if not has_role(user, "manager"):
         return await cb.answer("Недостатньо прав", show_alert=True)
-    S.cancel_expense(db, int(cb.data.split(":")[2]), user["telegram_id"])
-    await cb.answer("Витрату скасовано", show_alert=True)
+    n = S.cancel_expense(db, int(cb.data.split(":")[2]), user["telegram_id"])
+    await cb.answer("Витрату скасовано" + (f", видалено чеків: {n}" if n else ""), show_alert=True)
 
 
 # ---------------- очищення бази ----------------

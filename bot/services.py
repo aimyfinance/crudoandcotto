@@ -255,7 +255,8 @@ def cancel_purchase(db: Database, purchase_id: int, user_id: int, reason: str) -
                 "SELECT COUNT(*) FROM batches WHERE purchase_id=? AND grams_left <> grams_in", (purchase_id,)
             ).fetchone()[0]
             if used:
-                raise StockError("З партій цієї закупівлі вже були продажі/списання — спочатку скасуйте їх")
+                g = purchase_usage(db, purchase_id)
+                raise StockError(f"З партій цієї закупівлі вже списано {g} г (продажі/списання) — спочатку скасуйте їх")
             ts = now_utc()
             for b in c.execute("SELECT * FROM batches WHERE purchase_id=?", (purchase_id,)):
                 _movement(c, ts, b["product_id"], b["id"], -b["grams_in"],
@@ -646,10 +647,12 @@ def add_expense(db: Database, user_id: int, op_date: str, exp_type: str, categor
         return eid
 
 
-def cancel_expense(db: Database, expense_id: int, user_id: int) -> None:
+def cancel_expense(db: Database, expense_id: int, user_id: int) -> int:
+    """Скасовує витрату і видаляє прикріплені до неї чеки. Повертає кількість видалених документів."""
     with db.tx() as c:
         c.execute("UPDATE expenses SET status='cancelled' WHERE id=?", (expense_id,))
         audit(c, user_id, "expense.cancel", {"expense_id": expense_id})
+    return delete_documents_for(db, "expense", expense_id)
 
 
 def expense_categories(db: Database, exp_type: str | None = None) -> list[str]:
@@ -1009,6 +1012,47 @@ def list_documents(db: Database, kind: str, limit: int = 15):
 
 def get_document(db: Database, doc_id: int):
     return db.one("SELECT * FROM documents WHERE id=?", (doc_id,))
+
+
+def delete_documents_for(db: Database, kind: str, ref_id: int) -> int:
+    """Видаляє файли й записи документів, прикріплених до запису. Повертає кількість."""
+    from pathlib import Path as _P
+    rows = db.q("SELECT * FROM documents WHERE kind=? AND ref_id=?", (kind, ref_id))
+    for r in rows:
+        try:
+            _P(r["path"]).unlink(missing_ok=True)
+        except Exception:
+            pass
+    with db.tx() as c:
+        c.execute("DELETE FROM documents WHERE kind=? AND ref_id=?", (kind, ref_id))
+    return len(rows)
+
+
+def remove_batch(db: Database, batch_id: int, user_id: int, reason: str) -> None:
+    """Видаляє (обнуляє) одну партію, якщо з неї ще нічого не списано. Історія руху зберігається."""
+    ts = now_utc()
+    with db.tx() as c:
+        b = c.execute("SELECT * FROM batches WHERE id=?", (batch_id,)).fetchone()
+        if not b:
+            raise ValueError("Партію не знайдено")
+        if b["grams_left"] == 0 and b["grams_in"] > 0:
+            raise DuplicateOperation("Партія вже порожня")
+        if b["grams_left"] != b["grams_in"]:
+            raise StockError(f"З партії вже списано {b['grams_in'] - b['grams_left']} г — спершу скасуйте ті продажі/списання")
+        _movement(c, ts, b["product_id"], batch_id, -b["grams_in"],
+                  -round_cents(Decimal(b["grams_in"]) * d(b["landed_price_per_kg"]) / 1000), "purchase_cancel", "batch", batch_id, user_id)
+        # обнуляємо і прихід, і залишок: партія «видалена», але рух в історії зберігається
+        c.execute("UPDATE batches SET grams_left=0, grams_in=0, comment=COALESCE(comment,'') || ' [видалено: ' || ? || ']' WHERE id=?", (reason, batch_id))
+        if b["purchase_line_id"]:
+            c.execute("UPDATE batches SET purchase_line_id=NULL WHERE id=?", (batch_id,))
+            c.execute("DELETE FROM purchase_lines WHERE id=?", (b["purchase_line_id"],))
+        audit(c, user_id, "batch.remove", {"batch_id": batch_id, "reason": reason})
+
+
+def purchase_usage(db: Database, purchase_id: int) -> int:
+    """Скільки грамів уже списано з партій закупівлі."""
+    r = db.one("SELECT COALESCE(SUM(grams_in - grams_left),0) FROM batches WHERE purchase_id=?", (purchase_id,))
+    return int(r[0])
 
 
 def notify_targets(db: Database, min_role: str = "manager", actor_id: int | None = None) -> list[int]:

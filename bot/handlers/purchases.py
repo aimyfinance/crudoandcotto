@@ -11,7 +11,7 @@ from aiogram.types import CallbackQuery, Message
 
 from .. import services as S
 from ..db import get_db, today_local
-from ..keyboards import BACK, M_PURCHASE, M_PURCH_MANUAL, M_INVOICE, SKIP, TODAY, inline, main_menu, nav_kb, product_picker
+from ..keyboards import BACK, M_PURCHASE, M_PURCH_CANCEL, M_PURCH_MANUAL, M_INVOICE, SKIP, TODAY, inline, main_menu, nav_kb, product_picker
 from ..money import ParseError, fmt_grams, fmt_money, fmt_price, line_amount, parse_money, parse_weight_grams
 from .common import Flow, has_role, parse_date, ua_date
 
@@ -124,6 +124,47 @@ async def recent(msg: Message, db, user):
         return await msg.answer("Закупівель ще немає.")
     await msg.answer("📦 <b>Останні закупівлі</b>\n" + "\n".join(
         f"№{p['id']} {ua_date(p['doc_date'])} {p['supplier_name'] or ''} — {p['status']}" + (f" · {p['comment']}" if p["comment"] else "") for p in rows))
+
+
+@router.message(StateFilter(None), F.text == M_PURCH_CANCEL)
+async def cancel_list(msg: Message, db, user):
+    if not has_role(user, "manager"):
+        return
+    rows = [p for p in S.recent_purchases(db, 15) if p["status"] == "received"]
+    if not rows:
+        return await msg.answer("Немає закупівель для скасування.")
+    kb = []
+    for p_ in rows:
+        used = S.purchase_usage(db, p_["id"])
+        kb.append([(f"№{p_['id']} {ua_date(p_['doc_date'])} {p_['supplier_name'] or ''}" + (f" ⚠️ списано {used} г" if used else ""), f"purcx:ask:{p_['id']}")])
+    await msg.answer("🗑 Скасувати закупівлю — оберіть (⚠️ = з партій уже щось списано, скасувати не вийде):", reply_markup=inline(kb))
+
+
+@router.callback_query(F.data.startswith("purcx:ask:"))
+async def cancel_ask(cb: CallbackQuery, db, user):
+    if not has_role(user, "manager"):
+        return await cb.answer("Недостатньо прав", show_alert=True)
+    pid = int(cb.data.split(":")[2])
+    rows = db.q("SELECT b.grams_in, b.price_per_kg, p.name FROM batches b JOIN products p ON p.id=b.product_id WHERE b.purchase_id=?", (pid,))
+    docs = len(db.q("SELECT id FROM documents WHERE kind='purchase' AND ref_id=?", (pid,)))
+    txt = f"Скасувати закупівлю №{pid}?\n" + "\n".join(f"• {r['name']}: {fmt_grams(r['grams_in'])} × {fmt_price(r['price_per_kg'])} €/кг" for r in rows)
+    txt += f"\nПартії знімуться зі складу" + (f", {docs} документ(и) буде видалено з архіву" if docs else "") + "."
+    await cb.message.answer(txt, reply_markup=inline([[("🗑 Так, скасувати", f"purcx:yes:{pid}"), ("Ні", "noop")]]))
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("purcx:yes:"))
+async def cancel_yes(cb: CallbackQuery, db, user):
+    if not has_role(user, "manager"):
+        return await cb.answer("Недостатньо прав", show_alert=True)
+    pid = int(cb.data.split(":")[2])
+    try:
+        S.cancel_purchase(db, pid, user["telegram_id"], "скасовано менеджером")
+    except (S.StockError, S.DuplicateOperation) as e:
+        return await cb.answer(str(e), show_alert=True)
+    n = S.delete_documents_for(db, "purchase", pid)
+    await cb.message.answer(f"✅ Закупівлю №{pid} скасовано, залишки відновлено" + (f", видалено документів: {n}" if n else "") + ".")
+    await cb.answer()
 
 
 @router.message(F.text.in_({M_PURCHASE, M_PURCH_MANUAL}))

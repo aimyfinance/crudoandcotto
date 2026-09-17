@@ -150,7 +150,7 @@ async def batches(msg: Message, db, user, state: FSMContext):
 
 
 @router.callback_query(F.data.startswith("pp:bt:"))
-async def batches_pick(cb: CallbackQuery, db):
+async def batches_pick(cb: CallbackQuery, db, user):
     parts = cb.data.split(":")
     if parts[2] == "cat":
         await cb.message.edit_reply_markup(reply_markup=product_picker(db, "bt", parts[3], show_price=False))
@@ -158,7 +158,31 @@ async def batches_pick(cb: CallbackQuery, db):
     if parts[2] == "pg":
         await cb.message.edit_reply_markup(reply_markup=product_picker(db, "bt", parts[4] or None, int(parts[3]), show_price=False))
         return await cb.answer()
-    await cb.message.answer(batches_text(db, int(parts[3])))
+    pid = int(parts[3])
+    await cb.message.answer(batches_text(db, pid))
+    if has_role(user, "manager"):
+        rows = S.batches_of_product(db, pid)
+        if rows:
+            await cb.message.answer("Видалити партію (лише якщо з неї нічого не списано):", reply_markup=inline(
+                [[(f"🗑 #{b['id']} {b['batch_code'] or ''} {fmt_grams(b['grams_left'])}" + ("" if b["grams_left"] == b["grams_in"] else " ⚠️"), f"bt:rm:{b['id']}")] for b in rows]))
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("bt:rm:"))
+async def batch_remove(cb: CallbackQuery, db, user):
+    if not has_role(user, "manager"):
+        return await cb.answer("Недостатньо прав", show_alert=True)
+    bid = int(cb.data.split(":")[2])
+    if len(cb.data.split(":")) == 3:
+        b = db.one("SELECT b.*, p.name FROM batches b JOIN products p ON p.id=b.product_id WHERE b.id=?", (bid,))
+        await cb.message.answer(f"Видалити партію #{bid} {b['name']} {fmt_grams(b['grams_in'])} × {fmt_price(b['price_per_kg'])} €/кг?",
+                                reply_markup=inline([[("🗑 Так", f"bt:rm:{bid}:yes"), ("Ні", "noop")]]))
+        return await cb.answer()
+    try:
+        S.remove_batch(db, bid, user["telegram_id"], "видалено менеджером")
+    except (S.StockError, S.DuplicateOperation, ValueError) as e:
+        return await cb.answer(str(e), show_alert=True)
+    await cb.message.answer(f"✅ Партію #{bid} видалено зі складу.")
     await cb.answer()
 
 
