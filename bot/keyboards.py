@@ -44,6 +44,7 @@ M_EXP_ADD = "➕ Додати витрату"
 M_EXP_LIST = "🗑 Останні витрати"
 M_DOCS_EXP = "🗂 Чеки витрат"
 M_EXP_SUMMARY = "📊 Резюме витрат"
+M_EXP_DOC = "📄 Витрата з документа"
 M_PUR_SUMMARY = "📊 Резюме закупівель"
 M_SALE_SUMMARY = "📊 Резюме продажів"
 M_REP_TODAY = "📅 Звіт за сьогодні"
@@ -61,7 +62,7 @@ SUBMENUS = {
     G_PURCH: {"manager": [[M_INVOICE, M_PURCH_MANUAL], [M_BATCHES, M_DOCS_PURCH], [M_PUR_SUMMARY, M_PURCHASE + " (останні)"], [M_PURCH_CANCEL]]},
     G_STOCK: {"seller": [[M_STOCK, M_EXPIRY], [M_BATCHES]],
               "manager": [[M_STOCK, M_EXPIRY], [M_WRITEOFF, M_PRODUCTS], [M_BATCHES, M_OPENING]]},
-    G_EXP: {"manager": [[M_EXP_SUMMARY], [M_EXP_ADD, M_EXP_LIST], [M_DOCS_EXP]]},
+    G_EXP: {"manager": [[M_EXP_SUMMARY], [M_EXP_DOC, M_EXP_ADD], [M_EXP_LIST, M_DOCS_EXP]]},
     G_REP: {"manager": [[M_REPORTS], [M_SALE_SUMMARY, M_PUR_SUMMARY], [M_EXP_SUMMARY]]},
 }
 MENU_BUTTONS = {M_SALE, M_PURCHASE, M_STOCK, M_PRODUCTS, M_BATCHES, M_WRITEOFF, M_HISTORY, M_REPORTS, M_SETTINGS, M_TASKS}

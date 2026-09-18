@@ -222,7 +222,7 @@ async def shift_close_cash(msg: Message, state: FSMContext, db, user):
             expected = Decimal(s["cash_start"]) + rep["by_payment"]["cash"]
             summary += f" · очікувано {fmt_money(expected)} · різниця {fmt_money(cash - expected)}"
     await msg.answer("✅ " + summary, reply_markup=menu_for(user))
-    await _notify(msg.bot, db, summary + "\n\n" + day_summary_text(db, today_local()), exclude=user["telegram_id"])
+    await send_day_close(msg.bot, db, today_local(), summary, exclude=user["telegram_id"])
 
 
 async def _notify(bot: Bot, db, text: str, exclude: int | None = None) -> None:
@@ -242,16 +242,18 @@ DAYS_UA = {v: k for k, v in DAYS.items()}
 
 
 def parse_schedule(text: str) -> dict | None:
-    """'пт, сб 08:00-14:00' -> {'days':[4,5], 'open':'08:00', 'close':'14:00'}"""
+    """'пт 07:30-19:00; сб 07:30-14:30' або 'пт, сб 08:00-14:00' -> {'days': {4: ('07:30','19:00'), 5: (...)}}"""
     t = text.lower().replace("—", "-").replace("–", "-")
-    m = re.search(r"(\d{1,2}[:.]\d{2})\s*-\s*(\d{1,2}[:.]\d{2})", t)
-    if not m:
-        return None
-    days = [DAYS[d] for d in re.findall(r"пн|вт|ср|чт|пт|сб|нд", t)]
-    if not days:
-        return None
-    f = lambda s: s.replace(".", ":").zfill(5)
-    return {"days": sorted(set(days)), "open": f(m.group(1)), "close": f(m.group(2))}
+    f = lambda x: x.replace(".", ":").zfill(5)
+    days: dict[int, tuple[str, str]] = {}
+    for seg in re.split(r"[;\n]+", t):
+        m = re.search(r"(\d{1,2}[:.]\d{2})\s*-\s*(\d{1,2}[:.]\d{2})", seg)
+        names = re.findall(r"пн|вт|ср|чт|пт|сб|нд", seg)
+        if not m or not names:
+            continue
+        for d in names:
+            days[DAYS[d]] = (f(m.group(1)), f(m.group(2)))
+    return {"days": days} if days else None
 
 
 def schedule_text(db) -> str:
@@ -259,7 +261,7 @@ def schedule_text(db) -> str:
     if not raw:
         return "не задано"
     sc = parse_schedule(raw)
-    return f"{', '.join(DAYS_UA[d] for d in sc['days'])} {sc['open']}–{sc['close']}" if sc else raw
+    return "; ".join(f"{DAYS_UA[d]} {o}–{c}" for d, (o, c) in sorted(sc["days"].items())) if sc else raw
 
 
 @router.callback_query(F.data == "set:schedule")
@@ -267,8 +269,9 @@ async def schedule_start(cb: CallbackQuery, state: FSMContext, db, user):
     if not has_role(user, "manager"):
         return await cb.answer("Недостатньо прав", show_alert=True)
     await state.set_state(Shift.schedule)
-    await cb.message.answer(f"🕘 Графік ярмарків зараз: <b>{schedule_text(db)}</b>\nВведіть новий, наприклад: <code>пт, сб 08:00-14:00</code>\n"
-                            "Бот нагадає, якщо касу не відкрито через 30 хв після початку або не закрито через 30 хв після кінця.",
+    await cb.message.answer(f"🕘 Графік ярмарків зараз: <b>{schedule_text(db)}</b>\nВведіть новий, по днях через «;», наприклад: "
+                            "<code>пт 07:30-19:00; сб 07:30-14:30</code>\n"
+                            "Через 30 хв після кінця дня бот закриє зміну сам і надішле звіт; кнопка «⏹ Завершити зміну» робить це одразу.",
                             reply_markup=nav_kb(back=False))
     await cb.answer()
 
@@ -276,21 +279,41 @@ async def schedule_start(cb: CallbackQuery, state: FSMContext, db, user):
 @router.message(StateFilter(Shift.schedule), F.text)
 async def schedule_set(msg: Message, state: FSMContext, db, user):
     if not parse_schedule(msg.text):
-        return await msg.answer("⚠️ Формат: <code>пт, сб 08:00-14:00</code>")
+        return await msg.answer("⚠️ Формат: <code>пт 07:30-19:00; сб 07:30-14:30</code>")
     S.setting_set(db, "market_schedule", msg.text.strip())
     await state.clear()
     await msg.answer(f"✅ Графік: {schedule_text(db)}", reply_markup=menu_for(user))
 
 
 def day_summary_text(db, day: str) -> str:
-    """Вечірній підсумок для менеджера: виручка, топ-3, що закінчується, що спливає."""
+    """Звіт дня для менеджера: виручка, таблиця по товарах (кг · € · €/кг · маржа), оплата, списання, висновки."""
     rep = S.report_period(db, day, day)
-    out = [f"🌙 <b>Підсумок дня {ua_date(day)}</b>",
-           f"Виручка <b>{fmt_money(rep['revenue'])}</b> · {rep['sales_count']} чеків · {fmt_grams(rep['sold_grams'])} · вал. прибуток {fmt_money(rep['gross_profit'])}"]
+    avg = (rep["revenue"] / rep["sales_count"]) if rep["sales_count"] else Decimal(0)
+    out = [f"🌙 <b>Звіт дня {ua_date(day)}</b>",
+           f"Виручка <b>{fmt_money(rep['revenue'])}</b> · {rep['sales_count']} чеків · сер. чек {fmt_money(avg)} · {fmt_grams(rep['sold_grams'])}",
+           f"Валовий прибуток {fmt_money(rep['gross_profit'])}" + (f" ({rep['gross_profit'] / rep['revenue'] * 100:.0f} %)" if rep["revenue"] else "")]
     if rep["by_payment"]:
         out.append("Оплата: " + ", ".join(f"{S.PAYMENTS[k].lower()} {fmt_money(v)}" for k, v in rep["by_payment"].items()))
     if rep["by_product"]:
-        out.append("Топ-3: " + "; ".join(f"{e['name']} {fmt_money(e['amount'])}" for e in rep["by_product"][:3]))
+        lines = []
+        for e in rep["by_product"]:
+            kgp = (e["amount"] * 1000 / Decimal(e["grams"])) if e["grams"] else Decimal(0)
+            nm = e["name"] if len(e["name"]) <= 16 else e["name"][:15] + "…"
+            lines.append(f"{nm:<16} {e['grams'] / 1000:>5.2f} {float(e['amount']):>6.0f}€ {float(kgp):>5.1f} {float(e['margin_pct']):>3.0f}%")
+        out.append("<b>По товарах</b> — кг · € · €/кг · маржа\n<pre>" + "\n".join(lines).replace(".", ",") + "</pre>")
+    if rep["writeoff_grams"]:
+        pct = (Decimal(rep["writeoff_grams"]) / Decimal(rep["sold_grams"]) * 100) if rep["sold_grams"] else Decimal(0)
+        out.append(f"✂️ Списано за день: {fmt_grams(rep['writeoff_grams'])} ({pct:.1f} % від проданого) на {fmt_money(rep['writeoff_cost'])}")
+    concl = S.conclusions(db, rep)
+    if concl:
+        out.append("<b>Висновки</b>\n" + "\n".join(concl))
+    unm = S.setting_get(db, "day_unmatched")
+    if unm:
+        out.append(f"⚠️ У касі є назви без прив'язки до товарів бота: {unm}. Налаштування → 🔗 Прив'язки або Імпорт чеків Octobox.")
+        S.setting_set(db, "day_unmatched", "")
+    if S.setting_get(db, "day_shortfalls") == "1":
+        out.append("⚠️ Були продажі товарів, яких не було в залишку бота — внесіть закупівлі.")
+        S.setting_set(db, "day_shortfalls", "")
     low = S.low_stock(db)
     if low:
         out.append("📦 Закінчується: " + ", ".join(r["product"]["name"] for r in low[:6]))
@@ -315,6 +338,59 @@ def week_start_text(db) -> str:
     return "\n".join(out)
 
 
+async def send_day_close(bot: Bot, db, day: str, head: str, exclude: int | None = None) -> None:
+    """Повідомлення про закриття + звіт дня + пропозиція списати обрізки."""
+    await _notify(bot, db, head + "\n\n" + day_summary_text(db, day), exclude=exclude)
+    rep = S.report_period(db, day, day)
+    if rep["by_product"]:
+        ids = {p["name"]: p["id"] for p in S.list_products(db)}
+        kb = [[(f"✂️ {e['name'][:28]}", f"trim:{ids.get(e['name'], 0)}")] for e in rep["by_product"][:8] if ids.get(e["name"])]
+        kb.append([("✅ Обрізків немає", "trim:none")])
+        for uid in S.notify_targets(db, "manager"):
+            try:
+                await bot.send_message(uid, "✂️ Списати обрізки / усушку за день? Оберіть товар (можна кілька по черзі):", reply_markup=inline(kb))
+            except Exception:
+                pass
+
+
+class Trim(StatesGroup):
+    weight = State()
+
+
+@router.callback_query(F.data.startswith("trim:"))
+async def trim_pick(cb: CallbackQuery, state: FSMContext, db, user):
+    v = cb.data.split(":")[1]
+    if v == "none":
+        await cb.message.edit_reply_markup(reply_markup=None)
+        return await cb.answer("Добре, без списань")
+    p = S.get_product(db, int(v))
+    if not p:
+        return await cb.answer("Товар не знайдено", show_alert=True)
+    await state.set_state(Trim.weight)
+    await state.update_data(trim_pid=p["id"], trim_name=p["name"])
+    await cb.message.answer(f"✂️ {p['name']} — вага обрізків (г або кг), залишок {fmt_grams(S.stock_of_product(db, p['id']))}:", reply_markup=nav_kb(back=False))
+    await cb.answer()
+
+
+@router.message(StateFilter(Trim.weight), F.text)
+async def trim_weight(msg: Message, state: FSMContext, db, user):
+    from ..money import parse_weight_grams, ParseError
+    try:
+        g = parse_weight_grams(msg.text)
+    except ParseError as e:
+        return await msg.answer(f"⚠️ {e}")
+    data = await state.get_data()
+    try:
+        S.write_off(db, user["telegram_id"], data["trim_pid"], g, "Обрізки / усушка")
+    except S.StockError as e:
+        return await msg.answer(f"⚠️ {e}")
+    await state.clear()
+    rep = S.report_period(db, today_local(), today_local())
+    pct = (Decimal(rep["writeoff_grams"]) / Decimal(rep["sold_grams"]) * 100) if rep["sold_grams"] else Decimal(0)
+    await msg.answer(f"✅ Списано {fmt_grams(g)} {data['trim_name']}. За день списано {fmt_grams(rep['writeoff_grams'])} = {pct:.1f} % від проданого.",
+                     reply_markup=menu_for(user))
+
+
 async def shift_watchdog(bot: Bot) -> None:
     """Викликається щохвилини: нагадування про невідкриту/незакриту касу за графіком, прострочені завдання о 9:00."""
     db = get_db()
@@ -322,15 +398,19 @@ async def shift_watchdog(bot: Bot) -> None:
     key_day = now.date().isoformat()
     sc = parse_schedule(S.setting_get(db, "market_schedule"))
     if sc and now.weekday() in sc["days"]:
+        open_t, close_t = sc["days"][now.weekday()]
         hm = now.strftime("%H:%M")
-        open_alert = (dt.datetime.strptime(sc["open"], "%H:%M") + dt.timedelta(minutes=30)).strftime("%H:%M")
-        close_alert = (dt.datetime.strptime(sc["close"], "%H:%M") + dt.timedelta(minutes=30)).strftime("%H:%M")
+        open_alert = (dt.datetime.strptime(open_t, "%H:%M") + dt.timedelta(minutes=30)).strftime("%H:%M")
+        close_alert = (dt.datetime.strptime(close_t, "%H:%M") + dt.timedelta(minutes=30)).strftime("%H:%M")
         if hm == open_alert and not S.shifts_on(db, key_day) and S.setting_get(db, "alert_open") != key_day:
             S.setting_set(db, "alert_open", key_day)
-            await _notify(bot, db, f"⚠️ Ярмарковий день, {sc['open']} + 30 хв — каса ще не відкрита в боті.")
+            await _notify(bot, db, f"⚠️ Ярмарковий день, {open_t} + 30 хв — каса ще не відкрита в боті.")
         if hm == close_alert and S.current_shift(db) and S.setting_get(db, "alert_close") != key_day:
+            # кінець робочого дня + 30 хв — закриваємо зміну (ким би вона не була відкрита) і шлемо звіт
             S.setting_set(db, "alert_close", key_day)
-            await _notify(bot, db, f"⚠️ {sc['close']} + 30 хв — каса ще не закрита в боті.")
+            from ..config import settings as _cfg
+            S.close_shift(db, _cfg.admin_ids[0] if _cfg.admin_ids else 0, note="авто за графіком")
+            await send_day_close(bot, db, key_day, f"⏹ Каса закрита автоматично: кінець дня {close_t} + 30 хв.")
     if now.weekday() == 0 and now.strftime("%H:%M") == "08:00" and S.setting_get(db, "alert_week") != key_day:
         S.setting_set(db, "alert_week", key_day)
         await _notify(bot, db, week_start_text(db))

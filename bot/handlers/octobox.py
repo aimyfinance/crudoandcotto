@@ -68,31 +68,28 @@ async def run_sync(bot: Bot | None, user_id: int, since_days: int = 2, notify: b
         receipts = await fetch_receipts(c, since, cfg["weight_field"], cfg["pos_config"], TZ)
     st = import_octobox(receipts, user_id, since=None) if receipts else {"created": 0, "skipped_dup": 0, "completed": 0, "unmatched": {}, "shortfalls": [], "refunds": 0}
     S.setting_set(db, "octobox_last_sync", dt.datetime.now(TZ).isoformat())
-    # авто-зміна: перший чек сьогодні → відкрити; після закінчення графіка і 90 хв без чеків → закрити
+    # авто-зміна: перший чек сьогодні → відкрити (і знову відкрити, якщо чеки йдуть після закриття).
+    # Закриття — лише за графіком (через 30 хв після кінця) або кнопкою; див. tasks.shift_watchdog.
     today = today_local()
     todays = [r for r in receipts if r["dt"].date().isoformat() == today]
-    if todays and not S.current_shift(db) and not S.shifts_on(db, today):
-        S.open_shift(db, user_id)
-        S.setting_set(db, "shift_auto", today)
-        if bot:
-            await _notify(bot, db, f"▶️ Каса відкрита (перший чек Octobox о {min(r['dt'] for r in todays):%H:%M})")
-    sh = S.current_shift(db)
-    if sh and todays and S.setting_get(db, "shift_auto") == today:
-        last_dt = max(r["dt"] for r in todays)
-        if dt.datetime.now(TZ).replace(tzinfo=None) - last_dt > dt.timedelta(minutes=90):
-            S.close_shift(db, user_id, note="авто за Octobox")
-            from .tasks import day_summary_text
+    if todays and not S.current_shift(db):
+        last_close = db.one("SELECT closed_at FROM shifts WHERE shift_date=? AND closed_at IS NOT NULL ORDER BY id DESC LIMIT 1", (today,))
+        newest = max(r["dt"] for r in todays)
+        reopen = False
+        if last_close:
+            closed_local = dt.datetime.fromisoformat(last_close["closed_at"]).astimezone(TZ).replace(tzinfo=None)
+            reopen = newest > closed_local
+        if not last_close or reopen:
+            S.open_shift(db, user_id)
+            S.setting_set(db, "shift_auto", today)
             if bot:
-                await _notify(bot, db, f"⏹ Каса закрита (останній чек Octobox о {last_dt:%H:%M}).\n\n" + day_summary_text(db, today))
-    if bot and notify and (st["created"] or st.get("completed") or st["unmatched"]):
-        txt = f"🔄 Octobox: нових чеків {st['created']}"
-        if st.get("completed"):
-            txt += f", доповнено {st['completed']}"
-        if st["unmatched"]:
-            txt += "\n⚠️ Без прив'язки (пропущено): " + ", ".join(st["unmatched"])[:300] + "\nНалаштування → 🔗 Прив'язки або імпорт чеків файлом, щоб прив'язати."
-        if st["shortfalls"]:
-            txt += "\n⚠️ Продано без залишку в боті — внесіть закупівлі."
-        await _notify(bot, db, txt, admins_only=True)
+                await _notify(bot, db, ("🔁 Каса знову відкрита — надійшов чек Octobox о " if reopen else "▶️ Каса відкрита (перший чек Octobox о ")
+                              + f"{(newest if reopen else min(r['dt'] for r in todays)):%H:%M})")
+    # неприв'язані назви / нестачі — збираємо, повідомимо у звіті дня, а не протягом дня
+    if st["unmatched"]:
+        S.setting_set(db, "day_unmatched", ", ".join(sorted(set((S.setting_get(db, "day_unmatched") + "," + ",".join(st["unmatched"])).strip(",").split(",")))))
+    if st["shortfalls"]:
+        S.setting_set(db, "day_shortfalls", "1")
     return st
 
 

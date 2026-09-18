@@ -16,7 +16,7 @@ from .. import services as S
 from ..cash_import import parse_cash_report
 from ..config import TZ, settings
 from ..export import build_csv_movements, build_excel
-from ..keyboards import (menu_for, CANCEL, M_DOCS_EXP, M_DOCS_PURCH, M_EXP_ADD, M_EXP_LIST, M_EXP_SUMMARY, M_PUR_SUMMARY, M_SALE_SUMMARY, M_REP_MONTH, M_REP_PERIOD, M_REP_TODAY,
+from ..keyboards import (menu_for, CANCEL, M_DOCS_EXP, M_DOCS_PURCH, M_EXP_ADD, M_EXP_DOC, M_EXP_LIST, M_EXP_SUMMARY, M_PUR_SUMMARY, M_SALE_SUMMARY, M_REP_MONTH, M_REP_PERIOD, M_REP_TODAY,
                          M_REPORTS, M_SETTINGS, inline, main_menu, nav_kb, product_picker)
 from ..money import fmt_grams, fmt_money, fmt_price
 from ..db import today_local, get_db
@@ -407,6 +407,148 @@ async def exp_delask(cb: CallbackQuery, db, user):
 
 class ExpEdit(StatesGroup):
     value = State()
+
+
+class ExpDoc(StatesGroup):
+    file = State()
+    review = State()
+    field = State()
+
+
+EXP_MIME = {".pdf": "application/pdf", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}
+
+
+@router.message(StateFilter(None), F.text == M_EXP_DOC)
+async def expdoc_start(msg: Message, state: FSMContext, user):
+    if not has_role(user, "manager"):
+        return
+    import os
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        return await msg.answer("⚠️ Розпізнавання вимкнено: не задано ANTHROPIC_API_KEY.")
+    await state.clear()
+    await state.set_state(ExpDoc.file)
+    await msg.answer("📄 Надішліть акт, рахунок або чек (фото чи PDF):", reply_markup=nav_kb(back=False))
+
+
+@router.message(StateFilter(ExpDoc.file), F.document | F.photo)
+async def expdoc_file(msg: Message, state: FSMContext, db, user):
+    import asyncio, base64, os
+    from ..invoice import extract_expense
+    buf = io.BytesIO()
+    if msg.document:
+        ext = os.path.splitext(msg.document.file_name or "")[1].lower()
+        mime = EXP_MIME.get(ext) or msg.document.mime_type or ""
+        if mime not in EXP_MIME.values():
+            return await msg.answer("⚠️ Підтримуються PDF, JPG, PNG, WEBP")
+        await msg.bot.download(msg.document, destination=buf)
+        name = msg.document.file_name or "document"
+    else:
+        mime, name = "image/jpeg", f"expense_{today_local()}.jpg"
+        await msg.bot.download(msg.photo[-1], destination=buf)
+    await msg.answer("🔎 Розпізнаю документ… (10–20 с)")
+    try:
+        d = await asyncio.to_thread(extract_expense, buf.getvalue(), mime, S.expense_categories(db))
+    except Exception as e:
+        return await msg.answer(f"⚠️ Не вдалося розпізнати: {e}")
+    d["amount"] = str(d["amount"]) if d["amount"] is not None else None
+    d["date"] = d["date"] or today_local()
+    await state.update_data(expdoc=d, expdoc_b64=base64.b64encode(buf.getvalue()).decode(), expdoc_name=name)
+    await state.set_state(ExpDoc.review)
+    await _expdoc_review(msg, state)
+
+
+def _expdoc_text(d: dict) -> str:
+    amt = fmt_money(d["amount"]) if d.get("amount") else "<b>не розпізнано</b>"
+    extra = f" (нетто {fmt_money(d['net'])}, ПДВ {fmt_money(d['vat'])})" if d.get("net") and d.get("vat") else ""
+    return (f"📄 <b>{d.get('vendor') or 'Постачальник?'}</b>" + (f" · №{d['number']}" if d.get("number") else "") +
+            f"\n{d.get('description') or '—'}\nДата: {ua_date(d['date'])} · Сума брутто: <b>{amt}</b>{extra}"
+            f"\nТип: {S.EXP_TYPES[d.get('exp_type') or 'operating']} · Категорія: <b>{d.get('category') or 'оберіть'}</b>")
+
+
+async def _expdoc_review(msg: Message, state: FSMContext):
+    d = (await state.get_data())["expdoc"]
+    kb = [[("🏷 Категорія", "expdoc:cat"), ("💶 Сума", "expdoc:f:amount")],
+          [("📅 Дата", "expdoc:f:date"), ("📂 Тип", "expdoc:type")],
+          [("✅ Зберегти витрату" if d.get("amount") and d.get("category") else "(вкажіть суму і категорію)", "expdoc:save" if d.get("amount") and d.get("category") else "noop")]]
+    await msg.answer(_expdoc_text(d), reply_markup=inline(kb))
+
+
+@router.callback_query(StateFilter(ExpDoc.review), F.data == "expdoc:cat")
+async def expdoc_cat(cb: CallbackQuery, state: FSMContext, db):
+    cats = S.expense_categories(db)[:14]
+    await state.update_data(expdoc_cats=cats)
+    await state.set_state(ExpDoc.field)
+    await state.update_data(expdoc_field="category")
+    await cb.message.answer("Категорія — оберіть або введіть нову:", reply_markup=nav_kb(back=False))
+    if cats:
+        await cb.message.answer("Наявні:", reply_markup=inline([[(c[:40], f"expdoc:catpick:{i}")] for i, c in enumerate(cats)]))
+    await cb.answer()
+
+
+@router.callback_query(StateFilter(ExpDoc.field), F.data.startswith("expdoc:catpick:"))
+async def expdoc_catpick(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    d = data["expdoc"]; d["category"] = data["expdoc_cats"][int(cb.data.split(":")[2])]
+    await state.update_data(expdoc=d); await state.set_state(ExpDoc.review)
+    await cb.answer(); await _expdoc_review(cb.message, state)
+
+
+@router.callback_query(StateFilter(ExpDoc.review), F.data == "expdoc:type")
+async def expdoc_type(cb: CallbackQuery, state: FSMContext):
+    await cb.message.answer("Тип витрати:", reply_markup=inline([[(v, f"expdoc:settype:{k}")] for k, v in S.EXP_TYPES.items()]))
+    await cb.answer()
+
+
+@router.callback_query(StateFilter(ExpDoc.review), F.data.startswith("expdoc:settype:"))
+async def expdoc_settype(cb: CallbackQuery, state: FSMContext):
+    d = (await state.get_data())["expdoc"]; d["exp_type"] = cb.data.split(":")[2]
+    await state.update_data(expdoc=d); await cb.answer(); await _expdoc_review(cb.message, state)
+
+
+@router.callback_query(StateFilter(ExpDoc.review), F.data.startswith("expdoc:f:"))
+async def expdoc_field(cb: CallbackQuery, state: FSMContext):
+    f = cb.data.split(":")[2]
+    await state.set_state(ExpDoc.field); await state.update_data(expdoc_field=f)
+    await cb.message.answer("Сума брутто, €:" if f == "amount" else "Дата (15.09.2026):", reply_markup=nav_kb(back=False))
+    await cb.answer()
+
+
+@router.message(StateFilter(ExpDoc.field), F.text)
+async def expdoc_field_value(msg: Message, state: FSMContext):
+    from ..money import parse_money, ParseError
+    data = await state.get_data(); d = data["expdoc"]; f = data["expdoc_field"]
+    if f == "amount":
+        try:
+            d["amount"] = str(parse_money(msg.text))
+        except ParseError as e:
+            return await msg.answer(f"⚠️ {e}")
+    elif f == "date":
+        v = parse_date(msg.text)
+        if not v:
+            return await msg.answer("⚠️ Дата як 15.09.2026")
+        d["date"] = v
+    else:
+        d["category"] = msg.text.strip()[:60]
+    await state.update_data(expdoc=d); await state.set_state(ExpDoc.review)
+    await _expdoc_review(msg, state)
+
+
+@router.callback_query(StateFilter(ExpDoc.review), F.data == "expdoc:save")
+async def expdoc_save(cb: CallbackQuery, state: FSMContext, db, user):
+    import base64
+    from .tasks import save_document
+    data = await state.get_data(); d = data["expdoc"]
+    comment = " · ".join(x for x in (d.get("vendor"), d.get("description"), f"№{d['number']}" if d.get("number") else None) if x)[:120]
+    eid = S.add_expense(db, user["telegram_id"], d["date"], d.get("exp_type") or "operating", d["category"], Decimal(d["amount"]), comment)
+    try:
+        save_document(db, user["telegram_id"], "expense", eid, data.get("expdoc_name") or "document", base64.b64decode(data["expdoc_b64"]))
+    except Exception:
+        pass
+    await state.clear()
+    e = S.get_expense(db, eid)
+    await cb.message.answer("✅ Витрату записано, документ прикріплено.\n" + expense_card(e), reply_markup=expense_card_kb(e))
+    await cb.message.answer("Готово.", reply_markup=menu_for(user))
+    await cb.answer()
 
 
 @router.callback_query(F.data.startswith("exp:edit:"))

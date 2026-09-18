@@ -163,3 +163,41 @@ def post_draft(draft: dict, user_id: int, doc_date: str | None = None) -> int:
     comment = f"інвойс {draft.get('number') or ''} від {draft.get('date') or ''}".strip()
     return S.create_purchase(db, user_id, doc_date or draft.get("date") or S.today_local(), draft["supplier"] or "постачальник",
                              plines, extra, comment, receive=True)
+
+
+# ======================= витрата з документа (акт, рахунок, чек) =======================
+
+EXPENSE_PROMPT = """Ти витягуєш дані з документа про витрату (рахунок, акт, чек, замовлення) для обліку малого бізнесу.
+Поверни ЛИШЕ JSON без пояснень і без markdown:
+{
+ "vendor": "постачальник/виконавець",
+ "number": "номер документа або null",
+ "date": "YYYY-MM-DD (дата документа) або null",
+ "total_gross": число (сума до сплати БРУТТО, з ПДВ; коми як десятковий роздільник),
+ "total_net": число або null,
+ "vat": число або null,
+ "currency": "EUR",
+ "description": "2–6 слів, що куплено/зроблено (українською)",
+ "category_guess": одна з категорій зі списку нижче або null,
+ "expense_type": одне з: "operating" (операційні), "goods" (оплата товару), "tax" (податки), "investment" (інвестиції/обладнання)
+}
+Категорії, які вже є в обліку: {CATS}
+Не вигадуй значень, яких немає в документі."""
+
+
+def extract_expense(data: bytes, mime: str, categories: list[str]) -> dict:
+    client = _client()
+    b64 = base64.b64encode(data).decode()
+    block = ({"type": "document", "source": {"type": "base64", "media_type": mime, "data": b64}} if mime == "application/pdf"
+             else {"type": "image", "source": {"type": "base64", "media_type": mime, "data": b64}})
+    prompt = EXPENSE_PROMPT.replace("{CATS}", ", ".join(categories) if categories else "(ще немає)")
+    resp = client.messages.create(model=MODEL, max_tokens=800,
+                                  messages=[{"role": "user", "content": [block, {"type": "text", "text": prompt}]}])
+    parsed = parse_model_json("".join(getattr(p, "text", "") for p in resp.content))
+    return {
+        "vendor": (parsed.get("vendor") or "").strip(), "number": parsed.get("number"), "date": parsed.get("date"),
+        "amount": _d(parsed.get("total_gross")), "net": _d(parsed.get("total_net")), "vat": _d(parsed.get("vat")),
+        "description": (parsed.get("description") or "").strip(),
+        "category": parsed.get("category_guess") or None,
+        "exp_type": parsed.get("expense_type") if parsed.get("expense_type") in ("operating", "goods", "tax", "investment") else "operating",
+    }
