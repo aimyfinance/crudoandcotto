@@ -46,17 +46,22 @@ async def octobox_test(msg: Message, user):
                          "бот сам забиратиме чеки. Або /octobox_sync — разова синхронізація зараз.")
 
 
-async def run_sync(bot: Bot | None, user_id: int, since_days: int = 2, notify: bool = True) -> dict | None:
-    """Забирає чеки за останні N днів і проводить їх (ідемпотентно). Автоматично відкриває/закриває зміну."""
+async def run_sync(bot: Bot | None, user_id: int, since_days: int = 2, notify: bool = True,
+                   since_date: str | None = None, force: bool = False) -> dict | None:
+    """Забирає чеки за останні N днів (або з since_date) і проводить їх (ідемпотентно). Автоматично відкриває/закриває зміну."""
     from ..tools import import_octobox
     cl = _client()
     if not cl:
         return None
-    cfg = config()
     db = get_db()
+    if S.setting_get(db, "sync_paused") == "1" and not force:
+        return {"paused": True, "created": 0, "skipped_dup": 0, "completed": 0, "unmatched": {}, "shortfalls": [], "refunds": 0, "skipped_old": 0}
+    cfg = config()
     last = S.setting_get(db, "octobox_last_sync")
     since = dt.datetime.now(TZ) - dt.timedelta(days=since_days)
-    if last:
+    if since_date:
+        since = dt.datetime.fromisoformat(since_date).replace(tzinfo=TZ)
+    elif last:
         since = min(since, dt.datetime.fromisoformat(last).astimezone(TZ) - dt.timedelta(hours=6))
     async with cl as c:
         await c.authenticate()
@@ -101,17 +106,34 @@ async def _notify(bot: Bot, db, text: str, admins_only: bool = False) -> None:
 
 @router.message(Command("octobox_sync"))
 async def octobox_sync(msg: Message, user):
+    """/octobox_sync — за 2 дні; /octobox_sync 01.09.2026 — з дати. Знімає паузу синхронізації."""
     if user["role"] != "admin":
         return
     if not _client():
         return await msg.answer("Octobox не налаштовано (OCTOBOX_URL/LOGIN/PASSWORD).")
-    await msg.answer("🔄 Синхронізую чеки за останні 2 дні…")
+    from .common import parse_date
+    parts = (msg.text or "").split(maxsplit=1)
+    since_date = parse_date(parts[1]) if len(parts) > 1 else None
+    if len(parts) > 1 and not since_date:
+        return await msg.answer("⚠️ Дата як 01.09.2026")
+    db = get_db()
+    S.setting_set(db, "sync_paused", "0")
+    await msg.answer(f"🔄 Синхронізую чеки {'з ' + parts[1] if since_date else 'за останні 2 дні'}… (пауза синхронізації знята)")
     try:
-        st = await run_sync(msg.bot, user["telegram_id"], notify=False)
+        st = await run_sync(msg.bot, user["telegram_id"], notify=False, since_date=since_date, force=True)
     except Exception as e:
         return await msg.answer(f"❌ {type(e).__name__}: {e}")
     await msg.answer(f"✅ Нових чеків: {st['created']} · вже були: {st['skipped_dup']} · доповнено: {st.get('completed', 0)}"
-                     + (f"\n⚠️ Без прив'язки: {', '.join(st['unmatched'])}" if st["unmatched"] else ""))
+                     + (f"\n⚠️ Без прив'язки: {', '.join(st['unmatched'])}" if st["unmatched"] else "")
+                     + ("\n⚠️ Продано без залишку в боті — внесіть закупівлі й повторіть /octobox_sync" if st["shortfalls"] else ""))
+
+
+@router.message(Command("octobox_pause"))
+async def octobox_pause(msg: Message, user):
+    if user["role"] != "admin":
+        return
+    S.setting_set(get_db(), "sync_paused", "1")
+    await msg.answer("⏸ Синхронізацію з касою поставлено на паузу. Відновити: /octobox_sync")
 
 
 async def sync_loop(bot: Bot) -> None:

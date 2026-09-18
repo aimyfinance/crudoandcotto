@@ -738,7 +738,10 @@ async def reset_db_confirm(msg: Message, state: FSMContext, db, user):
     path = db.make_backup()
     await msg.answer_document(FSInputFile(path), caption="💾 Копія бази перед очищенням — збережіть.")
     S.reset_all_data(db, user["telegram_id"])
-    await msg.answer("🧹 Базу очищено. Тепер можна імпортувати історію.", reply_markup=menu_for(user))
+    await msg.answer("🧹 Базу очищено. Синхронізацію з касою поставлено на паузу.\n"
+                     "Порядок: 1) Імпорт історії → 2) Імпорт витрат → 3) закупівлі за вересень → "
+                     "4) Імпорт чеків Octobox (файл, вивчить ціни каси) → 5) <code>/octobox_sync 01.09.2026</code> (зніме паузу).",
+                     reply_markup=menu_for(user))
 
 
 # ---------------- налаштування ----------------

@@ -550,11 +550,21 @@ def reset_all_data(db: Database, user_id: int) -> None:
     """Повне очищення облікових даних (товари, партії, операції, витрати). Користувачі лишаються.
     Перед цим робиться резервна копія."""
     db.make_backup()
+    # файли документів закупівель і витрат — теж прибираємо (записи про них нижче)
+    from pathlib import Path as _P
+    for r in db.q("SELECT path FROM documents WHERE kind IN ('purchase','expense')"):
+        try:
+            _P(r["path"]).unlink(missing_ok=True)
+        except Exception:
+            pass
     with db.tx() as c:
         for t in ("sale_line_batches", "sale_lines", "sales", "writeoff_batches", "writeoffs", "stock_movements",
-                  "batches", "purchase_lines", "purchases", "suppliers", "products", "expenses", "cash_register_days",
-                  "processed_updates"):
+                  "batches", "purchase_lines", "purchases", "suppliers", "product_aliases", "products", "expenses",
+                  "cash_register_days", "processed_updates", "shifts", "fsm_state"):
             c.execute(f"DELETE FROM {t}")
+        c.execute("DELETE FROM documents WHERE kind IN ('purchase','expense')")
+        c.execute("DELETE FROM app_settings WHERE key IN ('octobox_last_sync','shift_auto','alert_open','alert_close') OR key LIKE 'grp:%'")
+        c.execute("INSERT INTO app_settings(key, value) VALUES ('sync_paused','1') ON CONFLICT(key) DO UPDATE SET value='1'")
         c.execute("DELETE FROM sqlite_sequence")
         audit(c, user_id, "db.reset", None)
 
