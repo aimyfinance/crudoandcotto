@@ -67,7 +67,8 @@ def env(tmp_path, dispatcher):
     S.upsert_user(db, SELLER, "seller", "Марія")
     session = FakeSession()
     bot = Bot("123:TEST", session=session, default=DefaultBotProperties(parse_mode="HTML"))
-    dispatcher.storage.storage.clear()
+    if hasattr(dispatcher.storage, 'storage'):
+        dispatcher.storage.storage.clear()
     return db, bot, dispatcher, session
 
 
@@ -198,9 +199,9 @@ async def test_piece_product_sale(env):
 async def test_seller_cannot_open_purchase_or_reports(env):
     db, bot, dp, s = env
     await send(dp, bot, SELLER, M_PURCHASE)
-    assert "менеджеру" in s.texts()[-1]
+    assert "недоступний" in s.texts()[-1]
     await send(dp, bot, SELLER, "📈 Звіти")
-    assert "менеджеру" in s.texts()[-1]
+    assert "недоступний" in s.texts()[-1]
 
 
 @pytest.mark.asyncio
@@ -217,7 +218,7 @@ async def test_report_and_excel_export(env, tmp_path):
     doc = [c for c in s.calls if type(c).__name__ == "SendDocument"][-1]
     from openpyxl import load_workbook
     wb = load_workbook(doc.document.path)
-    assert wb.sheetnames == ["Товар", "Зведення", "Оплати", "Продажі за товарами", "Залишки", "Операції"]
+    assert wb.sheetnames == ["Товар", "Зведення", "Оплати", "Продажі за товарами", "Залишки", "Витрати", "Операції"]
     ws = wb["Товар"]
     row = [c.value for c in ws[3]]
     assert row[1] == "Speck" and row[8] == 4.336 and row[12] == 3.236 and row[14] == 84.46

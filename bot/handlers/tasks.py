@@ -309,7 +309,8 @@ def day_summary_text(db, day: str) -> str:
         out.append("<b>Висновки</b>\n" + "\n".join(concl))
     unm = S.setting_get(db, "day_unmatched")
     if unm:
-        out.append(f"⚠️ У касі є назви без прив'язки до товарів бота: {unm}. Налаштування → 🔗 Прив'язки або Імпорт чеків Octobox.")
+        names = sorted(set(x.strip() for x in unm.split(",") if x.strip()))
+        out.append("⚠️ Назви каси без прив'язки (ці продажі не враховано): " + ", ".join(names) + ". Налаштування → ❓ Непривʼязані назви.")
         S.setting_set(db, "day_unmatched", "")
     if S.setting_get(db, "day_shortfalls") == "1":
         out.append("⚠️ Були продажі товарів, яких не було в залишку бота — внесіть закупівлі.")

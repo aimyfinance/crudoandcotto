@@ -896,7 +896,7 @@ def settings_kb(user):
                  [("🧾 Імпорт звіту каси", "set:cashimport")],
                  [("📥 Імпорт товарів з файлу", "set:prodimport"), ("📥 Імпорт початкових залишків", "set:openimport")],
                  [("📥 Імпорт історії руху товарів", "set:histimport"), ("📥 Імпорт витрат", "set:expimport")],
-                 [("🧾 Імпорт чеків Octobox (по товарах)", "set:octobox")], [("🔗 Прив'язки назв каси", "set:aliases")]]
+                 [("🧾 Імпорт чеків Octobox (по товарах)", "set:octobox")], [("🔗 Прив'язки назв каси", "set:aliases"), ("❓ Непривʼязані назви", "um:list")]]
     return inline(rows)
 
 

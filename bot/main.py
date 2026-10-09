@@ -19,7 +19,7 @@ from aiogram.types import BotCommand, FSInputFile, MenuButtonWebApp, WebAppInfo
 from . import services as S
 from .config import TZ, settings
 from .db import get_db
-from .handlers import adjustments, catalog, common, octobox, purchases, reports, sales, tasks
+from .handlers import adjustments, catalog, common, octobox, purchases, reports, sales, tasks, unmapped
 
 log = logging.getLogger("crudo")
 
@@ -80,7 +80,7 @@ def build_dispatcher(persistent: bool = True) -> Dispatcher:
     dp.message.outer_middleware(common.AuthMiddleware())
     dp.callback_query.outer_middleware(common.AuthMiddleware())
     # порядок важливий: спочатку сценарії зі станами, common (скасування) — першим
-    dp.include_routers(common.router, sales.router, purchases.router, catalog.router, adjustments.router, reports.router, tasks.router, octobox.router)
+    dp.include_routers(common.router, sales.router, purchases.router, catalog.router, adjustments.router, reports.router, tasks.router, octobox.router, unmapped.router)
     return dp
 
 

@@ -603,6 +603,44 @@ def list_aliases(db: Database):
     return db.q("SELECT a.*, p.name AS product_name FROM product_aliases a JOIN products p ON p.id=a.product_id ORDER BY a.alias_raw")
 
 
+def suggest_products(db: Database, raw: str, n: int = 3) -> list[tuple[int, str, float]]:
+    """Кандидати на прив'язку за схожістю назв (навіть слабкі) — для кнопок «це той товар?»."""
+    rt = _tokens(raw)
+    out = []
+    for p in db.q("SELECT id, name FROM products WHERE active=1"):
+        pt = _tokens(p["name"])
+        if not rt or not pt:
+            continue
+        hit = sum(1 for t in rt if any(_difflib.SequenceMatcher(None, t, q).ratio() >= 0.75 for q in pt))
+        score = hit / len(rt) + (0.3 if _difflib.SequenceMatcher(None, rt[0], pt[0]).ratio() >= 0.75 else 0)
+        score = max(score, _difflib.SequenceMatcher(None, norm_name(raw), norm_name(p["name"])).ratio())
+        if score >= 0.3:
+            out.append((p["id"], p["name"], score))
+    out.sort(key=lambda x: -x[2])
+    return out[:n]
+
+
+def unmapped_upsert(db: Database, name: str, count: int, amount) -> int:
+    with db.tx() as c:
+        c.execute("INSERT INTO pos_unmapped(name, count, amount, first_seen, last_seen) VALUES (?,?,?,?,?) "
+                  "ON CONFLICT(name) DO UPDATE SET count=count+excluded.count, amount=CAST(CAST(amount AS REAL)+CAST(excluded.amount AS REAL) AS TEXT), last_seen=excluded.last_seen",
+                  (name, count, str(amount), now_utc(), now_utc()))
+        return c.execute("SELECT id FROM pos_unmapped WHERE name=?", (name,)).fetchone()["id"]
+
+
+def unmapped_get(db: Database, uid: int):
+    return db.one("SELECT * FROM pos_unmapped WHERE id=?", (uid,))
+
+
+def unmapped_open(db: Database):
+    return db.q("SELECT * FROM pos_unmapped WHERE status='open' ORDER BY CAST(amount AS REAL) DESC")
+
+
+def unmapped_set(db: Database, uid: int, status: str, asked: bool = False) -> None:
+    with db.tx() as c:
+        c.execute("UPDATE pos_unmapped SET status=?, asked_at=COALESCE(?, asked_at) WHERE id=?", (status, now_utc() if asked else None, uid))
+
+
 def match_product(db: Database, raw: str) -> tuple[int | None, str]:
     """-> (product_id | None, спосіб: 'alias' | 'exact' | 'auto' | 'none')."""
     pid = get_alias(db, raw)

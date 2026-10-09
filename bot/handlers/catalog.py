@@ -485,6 +485,17 @@ async def p_sku(msg: Message, state: FSMContext, db, user):
                            data.get("piece_grams"), sku)
     await state.clear()
     await msg.answer("✅ Товар створено.\n" + product_card(S.get_product(db, pid)), reply_markup=menu_for(user))
+    if data.get("alias_for"):
+        from .octobox import run_sync
+        row = S.unmapped_get(db, data["alias_for"])
+        if row:
+            S.set_alias(db, row["name"], pid, user["telegram_id"]); S.unmapped_set(db, row["id"], "bound")
+            await msg.answer("🔗 Назву каси прив'язано. Дооблікую продажі за останні дні…")
+            st = await run_sync(None, user["telegram_id"], since_days=14, notify=False, force=True)
+            if st:
+                await msg.answer(f"✅ Додано {st.get('completed_lines', 0)} позицій у {st.get('completed', 0)} чеках.")
+            if data["mode"] == "weight":
+                await msg.answer("ℹ️ Якщо каса не передає вагу — задайте в картці товару «ціну каси за кг», щоб бот рахував вагу з суми чека.")
 
 
 # --- редагування полів картки ---

@@ -191,3 +191,19 @@ def test_reconcile(db, prod):
     rec = S.reconcile(db, day, day)[0]
     assert rec["bot_total"] == Decimal("8.00")
     assert rec["diff"] == Decimal("-0.50")
+
+
+def test_unmapped_suggest_and_upsert(db):
+    from decimal import Decimal
+    p1 = S.create_product(db, "Prosciutto Crudo Nazionale dissosato", "meat", "weight", Decimal("36"))
+    S.create_product(db, "Taleggio DOP", "cheese", "weight", Decimal("28"))
+    sug = S.suggest_products(db, "Prosciutto di Parma")
+    assert sug and sug[0][0] == p1
+    uid = S.unmapped_upsert(db, "Prosciutto di Parma", 25, Decimal("221.86"))
+    S.unmapped_upsert(db, "Prosciutto di Parma", 2, Decimal("10"))
+    row = S.unmapped_get(db, uid)
+    assert row["count"] == 27 and abs(float(row["amount"]) - 231.86) < 0.01 and row["status"] == "open"
+    S.unmapped_set(db, uid, "open", asked=True)
+    assert S.unmapped_get(db, uid)["asked_at"]
+    S.unmapped_set(db, uid, "ignored")
+    assert not S.unmapped_open(db)

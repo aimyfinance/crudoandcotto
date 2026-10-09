@@ -221,13 +221,20 @@ def diagnose_text(out: dict) -> str:
 
 # ---------------- синхронізація ----------------
 
+CARD_WORDS = ("kart", "card", "bankomat", "kredit", "sumup", "terminal", "visa", "master", "debit", "ec ", "ec-", "elektron", "unbar", "pos")
+SEEN_JOURNALS: set[str] = set()   # які назви журналів/способів оплати приходять з каси (для діагностики)
+
+
 def _receipt_from_order(o: dict, lines: list[dict], payments: list[dict], weight_field: str | None, tz) -> dict:
     d = dt.datetime.strptime(o["date_order"][:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=dt.timezone.utc).astimezone(tz).replace(tzinfo=None)
     pay = "cash"
     if payments:
         biggest = max(payments, key=lambda p: abs(float(p.get("amount") or 0)))
         name = str((biggest.get("payment_method_id") or ["", ""])[1]).lower()
-        pay = "card" if any(w in name for w in ("kart", "card", "bankomat", "kredit", "sumup", "terminal")) else "cash"
+        SEEN_JOURNALS.add(name or "?")
+        pay = "card" if any(w in name for w in CARD_WORDS) else "cash"
+    else:
+        SEEN_JOURNALS.add("(без оплат у чеку)")
     number = str(o.get("pos_reference") or o.get("name") or o["id"])
     # у Octobox номер чека виглядає як «1452» або «Order 00001-001-0001» — беремо цифри в кінці
     import re as _re

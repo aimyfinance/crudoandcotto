@@ -460,6 +460,7 @@ def _resolve_line(db, l: dict, cache: dict, st: dict, day: str, number: str, pla
     pid = cache[l["name"]]
     if not pid:
         st["unmatched"][l["name"]] = st["unmatched"].get(l["name"], 0) + 1
+        st.setdefault("unmatched_amount", {})[l["name"]] = st.get("unmatched_amount", {}).get(l["name"], Decimal(0)) + (l["amount"] or Decimal(0))
         return None
     prod = S.get_product(db, pid)
     grams, pieces = l["grams"], None

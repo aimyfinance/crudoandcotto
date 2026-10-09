@@ -11,7 +11,7 @@ from aiogram.types import Message
 from .. import services as S
 from ..config import TZ
 from ..db import get_db, today_local
-from ..octobox_api import OdooClient, OdooError, config, diagnose, diagnose_text, fetch_receipts
+from ..octobox_api import CARD_WORDS, OdooClient, OdooError, config, diagnose, diagnose_text, fetch_receipts
 from ..money import fmt_money
 
 log = logging.getLogger("crudo.octobox")
@@ -41,6 +41,9 @@ async def octobox_test(msg: Message, user):
     except Exception as e:
         return await msg.answer(f"❌ Не вдалося підключитись: {type(e).__name__}: {e}")
     await msg.answer(diagnose_text(out)[:4000])
+    pj = S.setting_get(get_db(), "pay_journals")
+    if pj:
+        await msg.answer(f"💳 Способи оплати, що приходили з каси при синхронізації: {pj}\nКартка розпізнається за словами: {', '.join(CARD_WORDS)}")
     if out.get("pos.order") and out.get("pos.order.line"):
         await msg.answer("Виглядає робочим. Наступний крок: задайте OCTOBOX_SYNC_MINUTES=10 (і OCTOBOX_WEIGHT_FIELD, якщо кандидатів кілька) — "
                          "бот сам забиратиме чеки. Або /octobox_sync — разова синхронізація зараз.")
@@ -68,6 +71,9 @@ async def run_sync(bot: Bot | None, user_id: int, since_days: int = 2, notify: b
         receipts = await fetch_receipts(c, since, cfg["weight_field"], cfg["pos_config"], TZ)
     st = import_octobox(receipts, user_id, since=None) if receipts else {"created": 0, "skipped_dup": 0, "completed": 0, "unmatched": {}, "shortfalls": [], "refunds": 0}
     S.setting_set(db, "octobox_last_sync", dt.datetime.now(TZ).isoformat())
+    from ..octobox_api import SEEN_JOURNALS
+    if SEEN_JOURNALS:
+        S.setting_set(db, "pay_journals", ", ".join(sorted(SEEN_JOURNALS)))
     # авто-зміна: перший чек сьогодні → відкрити (і знову відкрити, якщо чеки йдуть після закриття).
     # Закриття — лише за графіком (через 30 хв після кінця) або кнопкою; див. tasks.shift_watchdog.
     today = today_local()
@@ -87,10 +93,43 @@ async def run_sync(bot: Bot | None, user_id: int, since_days: int = 2, notify: b
                               + f"{(newest if reopen else min(r['dt'] for r in todays)):%H:%M})")
     # неприв'язані назви / нестачі — збираємо, повідомимо у звіті дня, а не протягом дня
     if st["unmatched"]:
-        S.setting_set(db, "day_unmatched", ", ".join(sorted(set((S.setting_get(db, "day_unmatched") + "," + ",".join(st["unmatched"])).strip(",").split(",")))))
+        prev = [x.strip() for x in S.setting_get(db, "day_unmatched").split(",") if x.strip()]
+        S.setting_set(db, "day_unmatched", ", ".join(sorted(set(prev + [x.strip() for x in st["unmatched"]]))))
+        await ask_unmapped(bot, db, st)
     if st["shortfalls"]:
         S.setting_set(db, "day_shortfalls", "1")
     return st
+
+
+async def ask_unmapped(bot: Bot | None, db, st: dict) -> None:
+    """Назви з каси без прив'язки: записуємо й один раз питаємо менеджера, до якого товару прив'язати."""
+    from ..keyboards import inline
+    amounts = st.get("unmatched_amount", {})
+    for name, cnt in st["unmatched"].items():
+        if "(немає ваги" in name:
+            continue
+        uid = S.unmapped_upsert(db, name, cnt, amounts.get(name, 0))
+        row = S.unmapped_get(db, uid)
+        if row["status"] != "open" or row["asked_at"] or not bot:
+            continue
+        S.unmapped_set(db, uid, "open", asked=True)
+        text, kb = unmapped_prompt(db, row)
+        for tg in S.notify_targets(db, "manager"):
+            try:
+                await bot.send_message(tg, text, reply_markup=inline(kb))
+            except Exception:
+                pass
+
+
+def unmapped_prompt(db, row) -> tuple[str, list]:
+    from ..money import fmt_money
+    sug = S.suggest_products(db, row["name"])
+    text = (f"🔗 Каса пробила <b>«{row['name']}»</b> — {row['count']} поз. на {fmt_money(row['amount'])}, "
+            "але в боті немає такого товару, тож ці продажі <b>не враховано</b>.\nДо якого товару прив'язати?")
+    kb = [[(f"✅ {n[:40]}", f"um:bind:{row['id']}:{pid}")] for pid, n, _ in sug]
+    kb.append([("📋 Обрати зі списку", f"um:pick:{row['id']}"), ("➕ Новий товар", f"um:new:{row['id']}")])
+    kb.append([("🚫 Це не товар, ігнорувати", f"um:ign:{row['id']}")])
+    return text, kb
 
 
 async def _notify(bot: Bot, db, text: str, admins_only: bool = False) -> None:
