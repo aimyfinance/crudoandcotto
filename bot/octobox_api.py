@@ -108,7 +108,7 @@ class OdooClient:
 
 WEIGHT_HINTS = ("weight", "gewicht", "peso", "kg", "gram")
 LINE_FIELDS_BASE = ["order_id", "product_id", "full_product_name", "qty", "price_subtotal_incl", "price_subtotal", "price_unit", "discount", "refunded_orderline_id"]
-ORDER_FIELDS_BASE = ["name", "pos_reference", "date_order", "state", "amount_total", "amount_paid", "config_id", "session_id", "payment_ids", "statement_ids", "lines"]
+ORDER_FIELDS_BASE = ["name", "pos_reference", "date_order", "state", "amount_total", "amount_paid", "config_id", "session_id", "payment_ids", "statement_ids", "journal_id", "sale_journal", "lines"]
 
 
 async def diagnose(client: OdooClient) -> dict:
@@ -207,9 +207,27 @@ async def diagnose(client: OdooClient) -> dict:
             pays = await client.search_read("pos.payment", [["id", "in", orders[0]["payment_ids"]]], ["amount", "payment_method_id"], limit=10)
             out["sample_payments"] = pays
             out["steps"].append("💳 оплати останнього чека: " + "; ".join(f"{(p.get('payment_method_id') or ['', '?'])[1]} {p.get('amount')}" for p in pays))
-        if orders and out.get("account.bank.statement.line") and orders[0].get("statement_ids"):
-            sts = await client.search_read("account.bank.statement.line", [["id", "in", orders[0]["statement_ids"]]], ["amount", "journal_id"], limit=10)
-            out["steps"].append("💳 оплати (виписка) останнього чека: " + "; ".join(f"{(p.get('journal_id') or ['', '?'])[1]} {p.get('amount')}" for p in sts))
+        if orders and out.get("account.bank.statement.line"):
+            try:
+                sf = await client.fields_get("account.bank.statement.line")
+                posf = [k for k in sf if any(h in k for h in ("pos", "order"))]
+                out["steps"].append("🧾 поля виписки, що вказують на чек: " + (", ".join(posf) or "немає"))
+                sts = []
+                if orders[0].get("statement_ids"):
+                    sts = await client.search_read("account.bank.statement.line", [["id", "in", orders[0]["statement_ids"]]], ["amount", "journal_id"], limit=10)
+                if not sts and "pos_statement_id" in sf:
+                    sts = await client.search_read("account.bank.statement.line", [["pos_statement_id", "=", orders[0]["id"]]], ["amount", "journal_id"], limit=10)
+                if not sts:
+                    sts = await client.search_read("account.bank.statement.line", [["ref", "=", orders[0].get("pos_reference") or orders[0].get("name")]], ["amount", "journal_id"], limit=10)
+                out["steps"].append("💳 оплати (виписка) останнього чека: " + ("; ".join(f"{(p.get('journal_id') or ['', '?'])[1]} {p.get('amount')}" for p in sts) or "не знайдено"))
+            except OdooError as e:
+                out["steps"].append(f"⚠️ виписка: {e}")
+        if out.get("account.journal"):
+            try:
+                js = await client.search_read("account.journal", [["type", "in", ["cash", "bank"]]], ["name", "type"], limit=30)
+                out["steps"].append("🏦 журнали оплат: " + "; ".join(f"{j['name']} ({j['type']})" for j in js))
+            except OdooError as e:
+                out["steps"].append(f"⚠️ журнали: {e}")
       except OdooError as e:
         out["steps"].append(f"⚠️ читання чеків: {e}")
     return out
@@ -317,12 +335,25 @@ async def fetch_receipts(client: OdooClient, since: dt.datetime, weight_field: s
     else:
         # Odoo 10–12: оплати — рядки банківської виписки чека, спосіб = журнал (Bar / Karte)
         st_ids = [sid for o in orders for sid in (o.get("statement_ids") or [])]
-        if st_ids:
-            sts = await client.search_read("account.bank.statement.line", [["id", "in", st_ids]], ["amount", "journal_id", "pos_statement_id"], limit=20000)
+        try:
+            if st_ids:
+                sts = await client.search_read("account.bank.statement.line", [["id", "in", st_ids]], ["amount", "journal_id", "pos_statement_id"], limit=20000)
+            else:
+                # Octobox: statement_ids у чеку порожні — шукаємо рядки виписки за посиланням на чек
+                sts = await client.search_read("account.bank.statement.line", [["pos_statement_id", "in", [o["id"] for o in orders]]],
+                                               ["amount", "journal_id", "pos_statement_id"], limit=20000)
             for p in sts:
                 oid = (p.get("pos_statement_id") or [None])[0]
                 if oid:
                     pay_by_order.setdefault(oid, []).append({"amount": p["amount"], "payment_method_id": p.get("journal_id")})
+        except OdooError:
+            pass
+        if not pay_by_order:
+            # останній варіант: журнал чека, якщо каса пише спосіб оплати в sale_journal / journal_id
+            for o in orders:
+                j = o.get("journal_id") or o.get("sale_journal")
+                if j:
+                    pay_by_order.setdefault(o["id"], []).append({"amount": o.get("amount_total") or 0, "payment_method_id": j})
     return [_receipt_from_order(o, by_order.get(o["id"], []), pay_by_order.get(o["id"], []), weight_field, tz) for o in orders]
 
 
