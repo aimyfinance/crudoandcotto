@@ -207,3 +207,31 @@ def test_unmapped_suggest_and_upsert(db):
     assert S.unmapped_get(db, uid)["asked_at"]
     S.unmapped_set(db, uid, "ignored")
     assert not S.unmapped_open(db)
+
+
+def test_purchase_absorbs_auto_batch(db):
+    """Продали за касою до внесення закупівлі → тимчасова партія; закупівля має її поглинути."""
+    import datetime as dt
+    from decimal import Decimal
+    from bot.tools import import_octobox
+    from bot.db import set_db
+    set_db(db); S.ensure_admins(db, [1])
+    pid = S.create_product(db, "Taleggio", "cheese", "weight", Decimal("28.9"))
+    day = dt.datetime.now()
+    rc = {"number": "5001", "dt": day, "payment": "cash", "refund": False, "odoo_id": 1,
+          "lines": [{"name": "Taleggio", "group": None, "grams": 1920, "amount": Decimal("55.46"), "discount": Decimal(0)}]}
+    st = import_octobox([rc], 1)
+    assert st["created"] == 1 and st["shortfalls"]
+    assert S.stock_of_product(db, pid) == 0
+    sale = db.one("SELECT * FROM sales WHERE client_key='octobox:5001'")
+    assert Decimal(sale["cost_total"]) == 0          # тимчасова партія без ціни → маржа 100 %
+    # менеджер вносить реальну поставку 6,69 кг по 8,70 €/кг (вже включає продані 1,92 кг)
+    S.create_purchase(db, 1, day.date().isoformat(), "Rognoni", [S.PurchaseLine(pid, 6690, Decimal("8.70"))])
+    assert S.stock_of_product(db, pid) == 6690 - 1920
+    sale = db.one("SELECT * FROM sales WHERE client_key='octobox:5001'")
+    assert Decimal(sale["cost_total"]) == Decimal("16.70")   # 1,92 кг × 8,70
+    auto = db.one("SELECT * FROM batches WHERE comment LIKE 'продано за касою%'")
+    assert auto["grams_left"] == 0 and "[зараховано" in auto["comment"]
+    # повторна закупівля вже нічого не поглинає
+    S.create_purchase(db, 1, day.date().isoformat(), "Rognoni", [S.PurchaseLine(pid, 1000, Decimal("8.70"))])
+    assert S.stock_of_product(db, pid) == 6690 - 1920 + 1000

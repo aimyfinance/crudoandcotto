@@ -241,8 +241,60 @@ def _receive_purchase(c, purchase_id: int, user_id: int) -> None:
         ).lastrowid
         _movement(c, ts, l["product_id"], bid, l["grams"], round_cents(Decimal(l["grams"]) * landed / 1000),
                   "purchase", "purchase", purchase_id, user_id)
+        _absorb_auto_batches(c, ts, l["product_id"], bid, landed, purchase_id, user_id)
     c.execute("UPDATE purchases SET status='received', received_at=? WHERE id=?", (ts, purchase_id))
     audit(c, user_id, "purchase.receive", {"purchase_id": purchase_id})
+
+
+AUTO_BATCH_TAG = "продано за касою"
+
+
+def _absorb_auto_batches(c, ts, product_id: int, new_bid: int, landed: Decimal, purchase_id: int, user_id: int) -> int:
+    """Товар продали за касою раніше, ніж внесли закупівлю: бот тоді створив тимчасову партію на продану вагу.
+    Тепер реальна закупівля містить і цю вагу — віднімаємо її з нової партії та перераховуємо собівартість продажів.
+    -> грамів зараховано."""
+    autos = c.execute("SELECT * FROM batches WHERE product_id=? AND source='opening' AND comment LIKE ? AND comment NOT LIKE '%[зараховано%' "
+                      "AND received_at >= datetime(?, '-21 days') ORDER BY id", (product_id, AUTO_BATCH_TAG + "%", ts)).fetchall()
+    absorbed = 0
+    for a in autos:
+        new = c.execute("SELECT grams_left FROM batches WHERE id=?", (new_bid,)).fetchone()
+        sold = a["grams_in"] - a["grams_left"]          # що реально пішло в продаж із тимчасової партії
+        take = min(a["grams_in"], new["grams_left"])
+        if take <= 0:
+            break
+        # 1) нова партія зменшується на вагу, яку вже продали
+        c.execute("UPDATE batches SET grams_left=grams_left-? WHERE id=?", (take, new_bid))
+        _movement(c, ts, product_id, new_bid, -take, -round_cents(Decimal(take) * landed / 1000), "adjustment", "purchase", purchase_id, user_id)
+        # 2) собівартість уже проведених продажів — за ціною цієї закупівлі
+        for slb in c.execute("SELECT * FROM sale_line_batches WHERE batch_id=?", (a["id"],)).fetchall():
+            new_cost = round_cents(Decimal(slb["grams"]) * landed / 1000)
+            diff = new_cost - d(slb["cost"])
+            if diff:
+                c.execute("UPDATE sale_line_batches SET cost=?, batch_id=? WHERE id=?", (str(new_cost), new_bid, slb["id"]))
+                c.execute("UPDATE sale_lines SET cost=CAST(CAST(cost AS REAL)+? AS TEXT) WHERE id=?", (float(diff), slb["sale_line_id"]))
+                c.execute("UPDATE sales SET cost_total=CAST(CAST(cost_total AS REAL)+? AS TEXT) WHERE id=(SELECT sale_id FROM sale_lines WHERE id=?)", (float(diff), slb["sale_line_id"]))
+            else:
+                c.execute("UPDATE sale_line_batches SET batch_id=? WHERE id=?", (new_bid, slb["id"]))
+        # 3) тимчасову партію закриваємо
+        leftover = a["grams_left"]
+        c.execute("UPDATE batches SET grams_left=0, landed_price_per_kg=?, comment=? WHERE id=?",
+                  (str(landed), f"{a['comment']} [зараховано у закупівлю №{purchase_id}]", a["id"]))
+        if leftover:
+            _movement(c, ts, product_id, a["id"], -leftover, ZERO, "adjustment", "purchase", purchase_id, user_id)
+        absorbed += take
+    if absorbed:
+        audit(c, user_id, "purchase.absorb", {"purchase_id": purchase_id, "product_id": product_id, "grams": absorbed})
+    return absorbed
+
+
+def absorbed_summary(db: Database, purchase_id: int) -> str:
+    rows = db.q("SELECT a.details FROM audit_log a WHERE a.action='purchase.absorb' AND a.details LIKE ?", (f'%"purchase_id": {purchase_id},%',))
+    parts = []
+    for r in rows:
+        det = json.loads(r["details"])
+        p = get_product(db, det["product_id"])
+        parts.append(f"{p['name']} −{det['grams']} г")
+    return ("ℹ️ Зараховано вагу, продану за касою до внесення закупівлі (залишок і собівартість виправлено): " + "; ".join(parts)) if parts else ""
 
 
 def cancel_purchase(db: Database, purchase_id: int, user_id: int, reason: str) -> None:

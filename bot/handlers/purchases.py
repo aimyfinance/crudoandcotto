@@ -326,6 +326,8 @@ async def confirm(cb: CallbackQuery, state: FSMContext, user, db):
         pass
     await cb.message.answer(f"✅ Закупівлю №{pid} проведено, залишки збільшено ({len(lines)} партій).",
                             reply_markup=menu_for(user))
+    if (ab := S.absorbed_summary(db, pid)):
+        await cb.message.answer(ab)
     cmp = price_comparison(db, pid)
     if cmp:
         await cb.message.answer(cmp)
@@ -599,6 +601,8 @@ async def inv_post(cb: CallbackQuery, state: FSMContext, db, user):
     await cb.message.answer(f"✅ Закупівлю №{pid} оприбутковано: {n} партій" + (f", пропущено {skipped} поз." if skipped else "") +
                             ". Прив'язки назв постачальника збережено — наступний інвойс розпізнається без правок.",
                             reply_markup=menu_for(user))
+    if (ab := S.absorbed_summary(db, pid)):
+        await cb.message.answer(ab)
     cmp = price_comparison(db, pid)
     if cmp:
         await cb.message.answer(cmp)
