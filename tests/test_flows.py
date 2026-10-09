@@ -199,7 +199,7 @@ async def test_piece_product_sale(env):
 async def test_seller_cannot_open_purchase_or_reports(env):
     db, bot, dp, s = env
     await send(dp, bot, SELLER, M_PURCHASE)
-    assert "недоступний" in s.texts()[-1]
+    assert "менеджеру" in s.texts()[-1]
     await send(dp, bot, SELLER, "📈 Звіти")
     assert "недоступний" in s.texts()[-1]
 
