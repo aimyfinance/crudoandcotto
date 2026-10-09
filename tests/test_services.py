@@ -235,3 +235,21 @@ def test_purchase_absorbs_auto_batch(db):
     # повторна закупівля вже нічого не поглинає
     S.create_purchase(db, 1, day.date().isoformat(), "Rognoni", [S.PurchaseLine(pid, 1000, Decimal("8.70"))])
     assert S.stock_of_product(db, pid) == 6690 - 1920 + 1000
+
+
+def test_unmatched_counted_on_reimport(db):
+    import datetime as dt
+    from decimal import Decimal
+    from bot.tools import import_octobox
+    from bot.db import set_db
+    set_db(db); S.ensure_admins(db, [1])
+    pid = S.create_product(db, "Golfetta", "meat", "weight", Decimal("45"))
+    S.add_opening_stock(db, 1, pid, 5000, Decimal("20"), None, dt.date.today().isoformat(), "test")
+    rc = {"number": "7001", "dt": dt.datetime.now(), "payment": "cash", "refund": False, "odoo_id": 1,
+          "lines": [{"name": "Golfetta", "group": None, "grams": 500, "amount": Decimal("22.5"), "discount": Decimal(0)},
+                    {"name": "Prosciutto di Parma", "group": None, "grams": 300, "amount": Decimal("12"), "discount": Decimal(0)}]}
+    st1 = import_octobox([rc], 1)
+    assert st1["created"] == 1 and st1["unmatched"] == {"Prosciutto di Parma": 1}
+    st2 = import_octobox([rc], 1)          # повторний синк — чек уже є
+    assert st2["skipped_dup"] == 1 and st2["unmatched"] == {"Prosciutto di Parma": 1}
+    assert st2["unmatched_amount"]["Prosciutto di Parma"] == Decimal("12")

@@ -507,6 +507,8 @@ def _complete_receipt(db, sale, rc: dict, user_id: int, cache: dict, st: dict) -
             cache[l["name"]] = S.match_product(db, l["name"])[0]
         pid = cache[l["name"]]
         if not pid:
+            st["unmatched"][l["name"]] = st["unmatched"].get(l["name"], 0) + 1
+            st.setdefault("unmatched_amount", {})[l["name"]] = st.get("unmatched_amount", {}).get(l["name"], Decimal(0)) + (l["amount"] or Decimal(0))
             continue
         pair = (pid, round_cents(l["amount"]))
         if pair in existing:
