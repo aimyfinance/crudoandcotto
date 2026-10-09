@@ -222,6 +222,14 @@ async def diagnose(client: OdooClient) -> dict:
                 out["steps"].append("💳 оплати (виписка) останнього чека: " + ("; ".join(f"{(p.get('journal_id') or ['', '?'])[1]} {p.get('amount')}" for p in sts) or "не знайдено"))
             except OdooError as e:
                 out["steps"].append(f"⚠️ виписка: {e}")
+        if out.get("account.bank.statement.line"):
+            try:
+                last = await client.search_read("account.bank.statement.line", [], ["name", "ref", "amount", "journal_id", "pos_statement_id", "statement_id", "create_date"], limit=5, order="id desc")
+                out["steps"].append("📑 останні рядки виписки: " + ("; ".join(
+                    f"{p.get('create_date')} {(p.get('journal_id') or ['', '?'])[1]} {p.get('amount')} ref={p.get('ref')} name={p.get('name')} pos={p.get('pos_statement_id')} st={(p.get('statement_id') or ['', ''])[1]}"
+                    for p in last) or "порожньо"))
+            except OdooError as e:
+                out["steps"].append(f"⚠️ рядки виписки: {e}")
         if out.get("account.journal"):
             try:
                 js = await client.search_read("account.journal", [["type", "in", ["cash", "bank"]]], ["name", "type"], limit=30)
@@ -239,7 +247,7 @@ def diagnose_text(out: dict) -> str:
 
 # ---------------- синхронізація ----------------
 
-CARD_WORDS = ("kart", "card", "bankomat", "kredit", "sumup", "terminal", "visa", "master", "debit", "ec ", "ec-", "elektron", "unbar", "pos")
+CARD_WORDS = ("kart", "card", "bankomat", "kredit", "sumup", "terminal", "visa", "master", "debit", "ec ", "ec-", "elektron", "unbar", "bank")
 SEEN_JOURNALS: set[str] = set()   # які назви журналів/способів оплати приходять з каси (для діагностики)
 
 
@@ -349,11 +357,31 @@ async def fetch_receipts(client: OdooClient, since: dt.datetime, weight_field: s
         except OdooError:
             pass
         if not pay_by_order:
-            # останній варіант: журнал чека, якщо каса пише спосіб оплати в sale_journal / journal_id
-            for o in orders:
-                j = o.get("journal_id") or o.get("sale_journal")
-                if j:
-                    pay_by_order.setdefault(o["id"], []).append({"amount": o.get("amount_total") or 0, "payment_method_id": j})
+            # рядки виписки без посилання на чек: зіставляємо за сумою і часом (±5 хв)
+            try:
+                since_s = min(o["date_order"] for o in orders)
+                sts = await client.search_read("account.bank.statement.line", [["create_date", ">=", since_s]],
+                                               ["amount", "journal_id", "ref", "name", "create_date", "date"], limit=20000)
+                by_amt: dict[str, list] = {}
+                for p in sts:
+                    by_amt.setdefault(f"{float(p.get('amount') or 0):.2f}", []).append(p)
+                for o in orders:
+                    key = f"{float(o.get('amount_total') or 0):.2f}"
+                    od = dt.datetime.strptime(o["date_order"][:19], "%Y-%m-%d %H:%M:%S")
+                    cands = by_amt.get(key, [])
+                    best = None
+                    for p in cands:
+                        nm = f"{p.get('ref') or ''} {p.get('name') or ''}"
+                        if o.get("name") and o["name"] in nm or (o.get("pos_reference") and o["pos_reference"] in nm):
+                            best = p; break
+                        pd_ = dt.datetime.strptime(str(p.get("create_date"))[:19], "%Y-%m-%d %H:%M:%S")
+                        if abs((pd_ - od).total_seconds()) <= 300 and best is None:
+                            best = p
+                    if best:
+                        cands.remove(best)
+                        pay_by_order[o["id"]] = [{"amount": best["amount"], "payment_method_id": best.get("journal_id")}]
+            except (OdooError, ValueError):
+                pass
     return [_receipt_from_order(o, by_order.get(o["id"], []), pay_by_order.get(o["id"], []), weight_field, tz) for o in orders]
 
 
