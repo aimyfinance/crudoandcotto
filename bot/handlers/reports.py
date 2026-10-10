@@ -35,6 +35,7 @@ class Sett(StatesGroup):
     db_file = State()
     cash_confirm = State()
     products_file = State()
+    inv_file = State()
     opening_file = State()
     history_file = State()
     expenses_file = State()
@@ -896,7 +897,8 @@ def settings_kb(user):
                  [("🧾 Імпорт звіту каси", "set:cashimport")],
                  [("📥 Імпорт товарів з файлу", "set:prodimport"), ("📥 Імпорт початкових залишків", "set:openimport")],
                  [("📥 Імпорт історії руху товарів", "set:histimport"), ("📥 Імпорт витрат", "set:expimport")],
-                 [("🧾 Імпорт чеків Octobox (по товарах)", "set:octobox")], [("🔗 Прив'язки назв каси", "set:aliases"), ("❓ Непривʼязані назви", "um:list")]]
+                 [("🧾 Імпорт чеків Octobox (по товарах)", "set:octobox")], [("🔗 Прив'язки назв каси", "set:aliases"), ("❓ Непривʼязані назви", "um:list")],
+                 [("📋 Імпорт інвентаризації (Excel)", "set:invimport")]]
     return inline(rows)
 
 
@@ -1030,6 +1032,43 @@ async def prod_import_start(cb: CallbackQuery, state: FSMContext, user):
         "Товари з такою самою назвою пропускаються, тож файл можна надсилати повторно.",
         reply_markup=nav_kb(back=False))
     await cb.answer()
+
+
+@router.callback_query(F.data == "set:invimport")
+async def inv_import_start(cb: CallbackQuery, state: FSMContext, user):
+    if user["role"] != "admin":
+        return await cb.answer("Лише адміністратор", show_alert=True)
+    await state.set_state(Sett.inv_file)
+    await cb.message.answer("📋 Надішліть заповнений файл інвентаризації (.xlsx) з аркушами «Інвентаризація», «Закупівля», «Прив'язки каси». "
+                            "Перед застосуванням зроблю резервну копію.", reply_markup=nav_kb(back=False))
+    await cb.answer()
+
+
+@router.message(StateFilter(Sett.inv_file), F.document)
+async def inv_import_file(msg: Message, state: FSMContext, user):
+    import asyncio
+    from ..inventory_xlsx import import_inventory_xlsx
+    doc = msg.document
+    if not (doc.file_name or "").lower().endswith(".xlsx"):
+        return await msg.answer("Потрібен файл .xlsx")
+    buf = io.BytesIO()
+    await msg.bot.download(doc, destination=buf)
+    p = Path(settings.db_path).parent / "inventory" / f"{msg.message_id}_{doc.file_name}"
+    p.parent.mkdir(parents=True, exist_ok=True); p.write_bytes(buf.getvalue())
+    get_db().make_backup()
+    wait = await msg.answer("⏳ Застосовую…")
+    try:
+        res = await asyncio.to_thread(import_inventory_xlsx, user["telegram_id"], p)
+    except Exception as e:
+        return await wait.edit_text(f"⚠️ Не вдалося прочитати файл: {e}")
+    await state.clear()
+    txt = [f"✅ <b>Інвентаризацію застосовано</b>", f"Закупівель: {res['purchases']} ({res['purchase_lines']} поз.) · прив'язок: {res['aliases']} · без змін: {res['unchanged']}"]
+    if res["adjusted"]:
+        txt.append("Коригування:\n" + "\n".join("• " + x for x in res["adjusted"][:40]))
+    if res["errors"]:
+        txt.append("⚠️ Помилки:\n" + "\n".join(res["errors"][:15]))
+    await wait.edit_text("\n".join(txt)[:4000])
+    await msg.answer("Перевірте 📦 Залишки.", reply_markup=menu_for(user))
 
 
 @router.message(StateFilter(Sett.products_file), F.document)
