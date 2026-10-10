@@ -230,6 +230,19 @@ async def diagnose(client: OdooClient) -> dict:
                     for p in last) or "порожньо"))
             except OdooError as e:
                 out["steps"].append(f"⚠️ рядки виписки: {e}")
+        try:
+            of = await client.fields_get("pos.order")
+            simple = sorted(k for k, v in of.items() if v.get("type") in ("char", "float", "integer", "monetary", "selection", "boolean", "many2one"))
+            out["steps"].append("🧾 усі поля чека: " + ", ".join(simple))
+            if orders:
+                o1 = await client.search_read("pos.order", [["id", "=", orders[0]["id"]]], [k for k in simple if k not in ("lines",)], limit=1)
+                if o1:
+                    vals = {k: v for k, v in o1[0].items() if v not in (None, False, 0, 0.0, "", [])}
+                    out["steps"].append("🔎 останній чек (усі непорожні поля): " + "; ".join(f"{k}={v}" for k, v in vals.items())[:1500])
+            models = await client.search_read("ir.model", ["|", "|", "|", ["model", "ilike", "pay"], ["model", "ilike", "zahl"], ["model", "ilike", "statement"], ["model", "ilike", "octobox"]], ["model", "name"], limit=60)
+            out["steps"].append("🧩 моделі про оплати: " + "; ".join(f"{m['model']}" for m in models))
+        except OdooError as e:
+            out["steps"].append(f"⚠️ поля чека/моделі: {e}")
         if out.get("account.journal"):
             try:
                 js = await client.search_read("account.journal", [["type", "in", ["cash", "bank"]]], ["name", "type"], limit=30)
