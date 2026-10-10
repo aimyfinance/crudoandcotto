@@ -241,6 +241,39 @@ async def diagnose(client: OdooClient) -> dict:
                     out["steps"].append("🔎 останній чек (усі непорожні поля): " + "; ".join(f"{k}={v}" for k, v in vals.items())[:1500])
             models = await client.search_read("ir.model", ["|", "|", "|", ["model", "ilike", "pay"], ["model", "ilike", "zahl"], ["model", "ilike", "statement"], ["model", "ilike", "octobox"]], ["model", "name"], limit=60)
             out["steps"].append("🧩 моделі про оплати: " + "; ".join(f"{m['model']}" for m in models))
+            # власні моделі Octobox (htspos.*): шукаємо ту, що посилається на чек, і показуємо записи останнього чека
+            hts = await client.search_read("ir.model", [["model", "ilike", "htspos"]], ["model"], limit=200)
+            out["steps"].append("🧩 моделі htspos: " + ", ".join(m["model"] for m in hts))
+            found = []
+            for m in hts:
+                try:
+                    mf = await client.fields_get(m["model"])
+                except OdooError:
+                    continue
+                ref = [k for k, v in mf.items() if v.get("relation") == "pos.order"]
+                paylike = [k for k in mf if any(h in k for h in ("pay", "journal", "method", "amount"))]
+                if ref or paylike:
+                    found.append(f"{m['model']}: ref={ref} поля={paylike[:12]}")
+                if ref and orders:
+                    try:
+                        simple = [k for k, v in mf.items() if v.get("type") in ("char", "float", "integer", "monetary", "selection", "boolean", "many2one", "date", "datetime")]
+                        recs = await client.search_read(m["model"], [[ref[0], "=", orders[0]["id"]]], simple, limit=5)
+                        for r in recs:
+                            vals = {k: v for k, v in r.items() if v not in (None, False, 0, 0.0, "", [])}
+                            found.append(f"   ↳ запис: " + "; ".join(f"{k}={v}" for k, v in vals.items())[:600])
+                    except OdooError as e:
+                        found.append(f"   ↳ {m['model']}: {e}")
+            out["steps"].append("💳 htspos з посиланням на чек:\n" + ("\n".join(found) or "нічого"))
+            # сесія каси: виписки по журналах
+            if orders and orders[0].get("session_id"):
+                try:
+                    sess = await client.search_read("pos.session", [["id", "=", orders[0]["session_id"][0]]], ["name", "statement_ids", "cash_register_balance_end_real"], limit=1)
+                    out["steps"].append(f"🧾 сесія: {sess[0] if sess else 'не читається'}")
+                    if sess and sess[0].get("statement_ids"):
+                        sts = await client.search_read("account.bank.statement", [["id", "in", sess[0]["statement_ids"]]], ["name", "journal_id", "balance_end_real", "total_entry_encoding"], limit=10)
+                        out["steps"].append("🏦 виписки сесії: " + "; ".join(f"{(x.get('journal_id') or ['', '?'])[1]}: {x.get('total_entry_encoding')} (кінц. {x.get('balance_end_real')})" for x in sts))
+                except OdooError as e:
+                    out["steps"].append(f"⚠️ сесія: {e}")
         except OdooError as e:
             out["steps"].append(f"⚠️ поля чека/моделі: {e}")
         if out.get("account.journal"):
