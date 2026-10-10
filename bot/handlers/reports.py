@@ -1283,13 +1283,50 @@ async def octo_run(cb: CallbackQuery, state: FSMContext, db, user):
 
 
 @router.callback_query(F.data == "set:aliases")
-async def aliases_list(cb: CallbackQuery, db):
+async def aliases_list(cb: CallbackQuery, db, state: FSMContext):
     rows = S.list_aliases(db)
     if not rows:
-        await cb.message.answer("Збережених прив'язок ще немає — вони з'являються, коли ви вручну зіставляєте назви під час імпорту чеків.")
-    else:
-        await cb.message.answer("🔗 <b>Назви каси → товари бота</b>\n" + "\n".join(f"• {r['alias_raw']} → {r['product_name']}" for r in rows))
+        await cb.message.answer("Збережених прив'язок ще немає — вони з'являються, коли ви зіставляєте назви каси з товарами.")
+        return await cb.answer()
+    await state.update_data(alx=[r["alias_raw"] for r in rows])
+    kb = [[(f"{r['alias_raw'][:22]} → {r['product_name'][:22]}" + (" (архів!)" if not r["product_active"] else ""), f"alx:e:{i}"), ("🗑", f"alx:d:{i}")] for i, r in enumerate(rows)]
+    await cb.message.answer("🔗 <b>Назви каси → товари бота</b>\nНатисніть рядок, щоб перев'язати, або 🗑, щоб видалити прив'язку.", reply_markup=inline(kb))
     await cb.answer()
+
+
+@router.callback_query(F.data.startswith("alx:"))
+async def aliases_edit(cb: CallbackQuery, db, state: FSMContext, user):
+    if not has_role(user, "manager"):
+        return await cb.answer("Недостатньо прав", show_alert=True)
+    parts = cb.data.split(":")
+    names = (await state.get_data()).get("alx") or []
+    if parts[1] in ("e", "d"):
+        i = int(parts[2])
+        if i >= len(names):
+            return await cb.answer("Список застарів — відкрийте Прив'язки ще раз", show_alert=True)
+        if parts[1] == "d":
+            S.delete_alias(db, names[i]); await cb.answer("Видалено")
+            return await aliases_list(cb, db, state)
+        await state.update_data(alx_name=names[i])
+        await cb.message.answer(f"Який товар бота відповідає «{names[i]}»?", reply_markup=product_picker(db, "alx", show_price=False))
+        return await cb.answer()
+
+
+@router.callback_query(F.data.startswith("pp:alx:"))
+async def aliases_pick(cb: CallbackQuery, db, state: FSMContext, user):
+    parts = cb.data.split(":")
+    if parts[2] in ("cat", "pg"):
+        cat = parts[3] if parts[2] == "cat" else (parts[4] or None)
+        page = int(parts[3]) if parts[2] == "pg" else 0
+        await cb.message.edit_reply_markup(reply_markup=product_picker(db, "alx", cat, page, show_price=False))
+        return await cb.answer()
+    name = (await state.get_data()).get("alx_name")
+    if not name:
+        return await cb.answer("Оберіть прив'язку заново", show_alert=True)
+    S.set_alias(db, name, int(parts[3]), user["telegram_id"])
+    p = S.get_product(db, int(parts[3]))
+    await cb.answer("Прив'язано")
+    await cb.message.answer(f"🔗 «{name}» → <b>{p['name']}</b>. Нові чеки підуть на цей товар.")
 
 
 @router.callback_query(F.data == "set:cashimport")

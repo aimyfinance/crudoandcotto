@@ -277,3 +277,17 @@ def test_hts_enrich_weights_and_payments():
     r2 = _receipt_from_order(orders[1], lines[2], pays[2], None, TZ)
     assert r1["payment"] == "card" and r2["payment"] == "cash"
     assert [l["grams"] for l in r1["lines"]] == [268, 188]
+
+
+def test_archived_product_not_matched(db):
+    from decimal import Decimal
+    p_short = S.create_product(db, "Taleggio", "cheese", "weight", Decimal("28"))
+    p_dop = S.create_product(db, "Taleggio DOP VERO ROGNONI", "cheese", "weight", Decimal("28"))
+    assert S.match_product(db, "Taleggio")[0] == p_short
+    S.update_product(db, p_short, active=0)
+    pid, how = S.match_product(db, "Taleggio")
+    assert pid != p_short                      # архівний не ловить продажі
+    S.set_alias(db, "Taleggio", p_dop, 1)
+    assert S.match_product(db, "Taleggio") == (p_dop, "alias")
+    S.delete_alias(db, "Taleggio")
+    assert S.match_product(db, "Taleggio")[1] != "alias"

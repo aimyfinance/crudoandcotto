@@ -640,8 +640,13 @@ def _tokens(s: str) -> list[str]:
 
 
 def get_alias(db: Database, raw: str):
-    r = db.one("SELECT product_id FROM product_aliases WHERE alias=?", (norm_name(raw),))
+    r = db.one("SELECT a.product_id FROM product_aliases a JOIN products p ON p.id=a.product_id WHERE a.alias=? AND p.active=1", (norm_name(raw),))
     return r["product_id"] if r else None
+
+
+def delete_alias(db: Database, raw: str) -> None:
+    with db.tx() as c:
+        c.execute("DELETE FROM product_aliases WHERE alias=?", (norm_name(raw),))
 
 
 def set_alias(db: Database, raw: str, product_id: int, user_id: int) -> None:
@@ -652,7 +657,7 @@ def set_alias(db: Database, raw: str, product_id: int, user_id: int) -> None:
 
 
 def list_aliases(db: Database):
-    return db.q("SELECT a.*, p.name AS product_name FROM product_aliases a JOIN products p ON p.id=a.product_id ORDER BY a.alias_raw")
+    return db.q("SELECT a.*, p.name AS product_name, p.active AS product_active FROM product_aliases a JOIN products p ON p.id=a.product_id ORDER BY a.alias_raw")
 
 
 def suggest_products(db: Database, raw: str, n: int = 3) -> list[tuple[int, str, float]]:
@@ -699,7 +704,7 @@ def match_product(db: Database, raw: str) -> tuple[int | None, str]:
     if pid:
         return pid, "alias"
     n = norm_name(raw)
-    row = db.one("SELECT id FROM products WHERE lower(trim(name))=?", (n,))
+    row = db.one("SELECT id FROM products WHERE lower(trim(name))=? AND active=1", (n,))
     if row:
         return row["id"], "exact"
     rt = _tokens(raw)
