@@ -40,7 +40,11 @@ async def octobox_test(msg: Message, user):
         return await msg.answer(f"❌ Odoo: {e}")
     except Exception as e:
         return await msg.answer(f"❌ Не вдалося підключитись: {type(e).__name__}: {e}")
-    await msg.answer(diagnose_text(out)[:4000])
+    text = diagnose_text(out)
+    while text:
+        cut = text.rfind("\n", 0, 3900) if len(text) > 3900 else len(text)
+        cut = cut if cut > 0 else 3900
+        await msg.answer(text[:cut]); text = text[cut:].lstrip("\n")
     pj = S.setting_get(get_db(), "pay_journals")
     if pj:
         await msg.answer(f"💳 Способи оплати, що приходили з каси при синхронізації: {pj}\nКартка розпізнається за словами: {', '.join(CARD_WORDS)}")
