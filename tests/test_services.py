@@ -253,3 +253,27 @@ def test_unmatched_counted_on_reimport(db):
     st2 = import_octobox([rc], 1)          # повторний синк — чек уже є
     assert st2["skipped_dup"] == 1 and st2["unmatched"] == {"Prosciutto di Parma": 1}
     assert st2["unmatched_amount"]["Prosciutto di Parma"] == Decimal("12")
+
+
+def test_hts_enrich_weights_and_payments():
+    import asyncio
+    from bot.octobox_api import _hts_enrich, _receipt_from_order
+    from bot.config import TZ
+
+    class FakeClient:
+        async def model_exists(self, m): return True
+        async def fields_get(self, m): return {k: {} for k in ("order_id", "payment_method_id", "scale_weight", "scale_weight_computed", "price_unit", "qty", "price_subtotal")}
+        async def search_read(self, model, domain, fields, limit=200, order=None):
+            return [{"order_id": [1, "K01/1874"], "payment_method_id": [3049, "Karte"], "scale_weight": 268.0, "price_unit": 10.18, "qty": 1.0},
+                    {"order_id": [1, "K01/1874"], "payment_method_id": [3049, "Karte"], "scale_weight": 188.0, "price_unit": 8.46, "qty": 1.0},
+                    {"order_id": [2, "K01/1875"], "payment_method_id": [3048, "Bar"], "scale_weight": 0.0, "scale_weight_computed": 0.5, "price_unit": 20.0, "qty": 1.0}]
+    orders = [{"id": 1, "date_order": "2026-10-09 13:39:11", "name": "K01/1874"}, {"id": 2, "date_order": "2026-10-09 13:40:00", "name": "K01/1875"}]
+    lines = {1: [{"order_id": [1], "price_unit": 10.18, "qty": 1.0, "price_subtotal_incl": 10.18, "product_id": [5, "Prosciutto Cotto"]},
+                 {"order_id": [1], "price_unit": 8.46, "qty": 1.0, "price_subtotal_incl": 8.46, "product_id": [6, "Golfetta"]}],
+             2: [{"order_id": [2], "price_unit": 20.0, "qty": 1.0, "price_subtotal_incl": 20.0, "product_id": [7, "Taleggio"]}]}
+    pays = asyncio.run(_hts_enrich(FakeClient(), orders, lines))
+    assert lines[1][0]["_scale_grams"] == 268 and lines[1][1]["_scale_grams"] == 188 and lines[2][0]["_scale_grams"] == 500
+    r1 = _receipt_from_order(orders[0], lines[1], pays[1], None, TZ)
+    r2 = _receipt_from_order(orders[1], lines[2], pays[2], None, TZ)
+    assert r1["payment"] == "card" and r2["payment"] == "cash"
+    assert [l["grams"] for l in r1["lines"]] == [268, 188]

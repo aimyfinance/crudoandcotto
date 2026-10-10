@@ -317,7 +317,9 @@ def _receipt_from_order(o: dict, lines: list[dict], payments: list[dict], weight
         amount = Decimal(str(l.get("price_subtotal_incl") if l.get("price_subtotal_incl") is not None else l.get("price_subtotal") or 0))
         qty = Decimal(str(l.get("qty") or 0))
         grams = 0
-        if weight_field and l.get(weight_field) not in (None, False, 0):
+        if l.get("_scale_grams"):
+            grams = int(l["_scale_grams"])
+        elif weight_field and l.get(weight_field) not in (None, False, 0):
             w = Decimal(str(l[weight_field]))
             grams = int(w if w >= 20 else w * 1000)   # >=20 → вже грами, інакше кг
         elif qty and qty != qty.to_integral():
@@ -343,6 +345,50 @@ def _receipt_from_order(o: dict, lines: list[dict], payments: list[dict], weight
                        "discount": Decimal(str(l.get("discount") or 0))})
     total = sum((x["amount"] for x in rlines), Decimal(0))
     return {"number": digits, "dt": d, "payment": pay, "refund": total < 0 or str(o.get("state")) == "cancel", "lines": rlines, "odoo_id": o["id"]}
+
+
+async def _hts_enrich(client: OdooClient, orders: list[dict], by_order: dict[int, list]) -> dict[int, list]:
+    """htspos.order_product → у рядки чека дописує _scale_grams (вага з ваг), повертає оплати по чеках {order_id: [{amount, payment_method_id}]}."""
+    out: dict[int, list] = {}
+    try:
+        if not await client.model_exists("htspos.order_product"):
+            return out
+        hf = await client.fields_get("htspos.order_product")
+        want = [f for f in ("order_id", "payment_method_id", "scale_weight", "scale_weight_computed", "price_unit", "qty", "price_subtotal", "display_name") if f in hf]
+        if "order_id" not in want:
+            return out
+        recs = await client.search_read("htspos.order_product", [["order_id", "in", [o["id"] for o in orders]]], want, limit=50000)
+    except OdooError:
+        return out
+    by_o: dict[int, list] = {}
+    for r in recs:
+        by_o.setdefault((r.get("order_id") or [None])[0], []).append(r)
+    for oid, hrecs in by_o.items():
+        # оплати: сума позицій за способом оплати
+        pays: dict[str, dict] = {}
+        for r in hrecs:
+            pm = r.get("payment_method_id") or [None, ""]
+            amt = float(r.get("price_unit") or 0) * float(r.get("qty") or 1)
+            e = pays.setdefault(str(pm[1]), {"amount": 0.0, "payment_method_id": pm})
+            e["amount"] += amt
+        if pays:
+            out[oid] = list(pays.values())
+        # вага: зіставляємо з рядками чека за ціною позиції (price_unit) і кількістю
+        used: set[int] = set()
+        for l in by_order.get(oid, []):
+            pu, q = float(l.get("price_unit") or 0), float(l.get("qty") or 0)
+            for i, r in enumerate(hrecs):
+                if i in used:
+                    continue
+                if abs(float(r.get("price_unit") or 0) - pu) < 0.005 and abs(float(r.get("qty") or 0) - q) < 0.001:
+                    w = r.get("scale_weight") or 0
+                    if not w and r.get("scale_weight_computed"):
+                        w = float(r["scale_weight_computed"]) * 1000
+                    if w and float(w) > 0:
+                        l["_scale_grams"] = int(round(float(w) * (q if q > 1 else 1)))
+                    used.add(i)
+                    break
+    return out
 
 
 async def fetch_receipts(client: OdooClient, since: dt.datetime, weight_field: str | None, pos_config: str | None, tz) -> list[dict]:
@@ -381,6 +427,10 @@ async def fetch_receipts(client: OdooClient, since: dt.datetime, weight_field: s
     for l in all_lines:
         by_order.setdefault(l["order_id"][0], []).append(l)
     pay_by_order: dict[int, list] = {}
+    # Octobox (HTS POS): htspos.order_product містить вагу з ваг і спосіб оплати по кожній позиції
+    hts_pay = await _hts_enrich(client, orders, by_order)
+    for oid, pays in hts_pay.items():
+        pay_by_order[oid] = pays
     pay_ids = [pid for o in orders for pid in (o.get("payment_ids") or [])]
     if pay_ids:
         pays = await client.search_read("pos.payment", [["id", "in", pay_ids]], ["amount", "payment_method_id", "pos_order_id"], limit=20000)

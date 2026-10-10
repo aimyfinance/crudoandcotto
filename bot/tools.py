@@ -418,6 +418,10 @@ def import_octobox(receipts: list[dict], user_id: int, since: str | None = None,
         if existing:
             st["skipped_dup"] += 1
             if existing["status"] == "done" and not rc["refund"]:
+                if rc.get("payment") in ("cash", "card") and existing["payment_method"] != rc["payment"]:
+                    with db.tx() as c:   # спосіб оплати уточнився (каса віддала Bar/Karte) — оновлюємо
+                        c.execute("UPDATE sales SET payment_method=? WHERE id=?", (rc["payment"], existing["id"]))
+                    st["payment_fixed"] = st.get("payment_fixed", 0) + 1
                 _complete_receipt(db, existing, rc, user_id, cache, st)
             continue
         total = sum((l["amount"] for l in rc["lines"]), Decimal(0))
