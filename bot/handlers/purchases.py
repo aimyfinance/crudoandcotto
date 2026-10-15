@@ -345,6 +345,7 @@ class Inv(StatesGroup):
     review = State()
     line_product = State()
     line_regname = State()
+    line_regnew = State()
     line_weight = State()
     line_price = State()
     transport = State()
@@ -517,15 +518,16 @@ async def _reg_show(msg: Message, state: FSMContext, db):
     page = data.get("reg_page", 0); per = 8
     chunk = names[page * per:(page + 1) * per]
     await state.update_data(reg_names=chunk)
-    if not names:
-        await msg.answer("Список назв каси порожній (Octobox не відповів). Надішліть назву так, як вона записана в касі, текстом — прив'яжу її.", reply_markup=nav_kb(back=False))
-        return
     kb = [[((("🔗 " if S.norm_name(n) in bound else "") + n)[:60], f"inv:reg:{k}")] for k, n in enumerate(chunk)]
     nav = []
     if page > 0: nav.append(("⬅️", "inv:regpg:prev"))
     if (page + 1) * per < len(names): nav.append(("➡️", "inv:regpg:next"))
     if nav: kb.append(nav)
+    kb.append([("➕ Товару ще нема в касі — вписати назву", "inv:regnew")])
     kb.append([("◀️ Назад до позиції", "inv:regback")])
+    if not names:
+        await msg.answer("У касі такого товару ще не було. Натисніть «➕ Товару ще нема в касі» і впишіть назву, якою заведете його в Octobox.", reply_markup=inline(kb))
+        return
     await msg.answer(f"Яка назва в касі відповідає «{d['lines'][i]['description'][:50]}» → <b>{d['lines'][i]['product_name']}</b>?\n"
                      f"Оберіть зі списку ({len(names)}) або надішліть частину назви для пошуку. 🔗 — уже прив'язано до іншого товару.",
                      reply_markup=inline(kb))
@@ -536,6 +538,25 @@ async def inv_reg_page(cb: CallbackQuery, state: FSMContext, db):
     data = await state.get_data(); page = data.get("reg_page", 0)
     await state.update_data(reg_page=max(0, page + (1 if cb.data.endswith("next") else -1)))
     await cb.answer(); await _reg_show(cb.message, state, db)
+
+
+@router.callback_query(StateFilter(Inv.line_regname), F.data == "inv:regnew")
+async def inv_reg_new(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data(); d, i = data["draft"], data["inv_i"]
+    await state.set_state(Inv.line_regnew)
+    await cb.message.answer(f"Впишіть назву, якою ви заведете «{d['lines'][i]['product_name']}» у касі Octobox (точно так, як буде на екрані каси):",
+                            reply_markup=nav_kb(back=False))
+    await cb.answer()
+
+
+@router.message(StateFilter(Inv.line_regnew), F.text)
+async def inv_reg_new_name(msg: Message, state: FSMContext, db):
+    if msg.text == BACK:
+        await state.set_state(Inv.line_regname); return await _reg_show(msg, state, db)
+    name = msg.text.strip()
+    if len(name) < 2:
+        return await msg.answer("Занадто коротка назва")
+    await _reg_bind(msg, state, db, name, new_in_register=True)
 
 
 @router.callback_query(StateFilter(Inv.line_regname), F.data == "inv:regback")
@@ -567,7 +588,7 @@ async def inv_reg_pick(cb: CallbackQuery, state: FSMContext, db):
     await _reg_bind(cb.message, state, db, names[k])
 
 
-async def _reg_bind(msg: Message, state: FSMContext, db, reg_name: str):
+async def _reg_bind(msg: Message, state: FSMContext, db, reg_name: str, new_in_register: bool = False):
     data = await state.get_data()
     d, i = data["draft"], data["inv_i"]
     l = d["lines"][i]
@@ -576,8 +597,15 @@ async def _reg_bind(msg: Message, state: FSMContext, db, reg_name: str):
     row = db.one("SELECT id FROM pos_unmapped WHERE name=? AND status='open'", (reg_name,))
     if row:
         S.unmapped_set(db, row["id"], "bound")
+    if new_in_register:
+        import json
+        seen = set(json.loads(S.setting_get(db, "register_names") or "[]")); seen.add(reg_name)
+        S.setting_set(db, "register_names", json.dumps(sorted(seen, key=str.lower), ensure_ascii=False))
     await state.update_data(draft=d); await state.set_state(Inv.review)
-    await msg.answer(f"🔗 Каса «{reg_name}» → <b>{l['product_name']}</b>. Продажі з каси тепер списуватимуться з цього товару.")
+    if new_in_register:
+        await msg.answer(f"🔗 «{reg_name}» → <b>{l['product_name']}</b>.\n⚠️ Тепер заведіть товар у касі Octobox з назвою <b>{reg_name}</b> (точно так само) — перший же чек бот впізнає сам.")
+    else:
+        await msg.answer(f"🔗 Каса «{reg_name}» → <b>{l['product_name']}</b>. Продажі з каси тепер списуватимуться з цього товару.")
     if S.norm_name(reg_name) != S.norm_name(l["product_name"]):
         taken = db.one("SELECT id FROM products WHERE lower(name)=lower(?) AND id<>?", (reg_name, l["product_id"]))
         if not taken:
