@@ -75,6 +75,13 @@ async def run_sync(bot: Bot | None, user_id: int, since_days: int = 2, notify: b
         receipts = await fetch_receipts(c, since, cfg["weight_field"], cfg["pos_config"], TZ)
     st = import_octobox(receipts, user_id, since=None) if receipts else {"created": 0, "skipped_dup": 0, "completed": 0, "unmatched": {}, "shortfalls": [], "refunds": 0}
     S.setting_set(db, "octobox_last_sync", dt.datetime.now(TZ).isoformat())
+    if receipts:
+        import json
+        seen = set(json.loads(S.setting_get(db, "register_names") or "[]"))
+        seen |= {l["name"] for r in receipts for l in r["lines"] if l.get("name")}
+        S.setting_set(db, "register_names", json.dumps(sorted(seen, key=str.lower), ensure_ascii=False))
+        if not S.setting_get(db, "register_names_at"):
+            S.setting_set(db, "register_names_at", dt.datetime.now(TZ).isoformat())
     from ..octobox_api import SEEN_JOURNALS
     if SEEN_JOURNALS:
         S.setting_set(db, "pay_journals", ", ".join(sorted(SEEN_JOURNALS)))
@@ -145,19 +152,24 @@ async def register_names(force: bool = False) -> list[str]:
     ts = S.setting_get(db, "register_names_at")
     if cached and not force and ts and (dt.datetime.now(TZ) - dt.datetime.fromisoformat(ts)).total_seconds() < 86400:
         return json.loads(cached)
+    import asyncio
     cl = _client()
     names: list[str] = json.loads(cached) if cached else []
     if cl:
-        try:
+        async def _load():
             async with cl as c:
                 await c.authenticate()
-                names = await fetch_register_names(c, config()["pos_config"])
+                return await fetch_register_names(c, config()["pos_config"])
+        try:
+            names = await asyncio.wait_for(_load(), timeout=20)
             S.setting_set(db, "register_names", json.dumps(names, ensure_ascii=False))
             S.setting_set(db, "register_names_at", dt.datetime.now(TZ).isoformat())
+        except asyncio.TimeoutError:
+            log.warning("register_names: timeout, using cache (%d)", len(names))
         except Exception as e:
             log.warning("register_names: %s", e)
-    # + назви, які вже бачили у чеках, але ще не прив'язані
-    extra = [r["name"] for r in S.unmapped_open(db)]
+    # + назви з прив'язок і ще не прив'язані з чеків — список ніколи не порожній
+    extra = [r["name"] for r in S.unmapped_open(db)] + [r["alias_raw"] for r in S.list_aliases(db)]
     return sorted(set(names) | set(extra), key=str.lower)
 
 

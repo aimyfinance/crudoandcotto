@@ -469,7 +469,6 @@ async def inv_edit(cb: CallbackQuery, state: FSMContext, db, user):
         if not d["lines"][i]["product_id"]:
             await cb.answer("Спочатку оберіть товар бота (🧀 Товар або ➕ Створити)", show_alert=True); return
         await state.set_state(Inv.line_regname); await state.update_data(reg_page=0, reg_q="")
-        await cb.message.answer("⏳ Беру список назв із каси…")
         await _reg_show(cb.message, state, db)
     elif what == "skip":
         d["lines"][i]["skip"] = not d["lines"][i].get("skip")
@@ -519,7 +518,7 @@ async def _reg_show(msg: Message, state: FSMContext, db):
     chunk = names[page * per:(page + 1) * per]
     await state.update_data(reg_names=chunk)
     if not names:
-        await msg.answer("Список назв каси порожній — Octobox недоступний або нічого не продавалось. Введіть назву вручну текстом.", reply_markup=nav_kb(back=False))
+        await msg.answer("Список назв каси порожній (Octobox не відповів). Надішліть назву так, як вона записана в касі, текстом — прив'яжу її.", reply_markup=nav_kb(back=False))
         return
     kb = [[((("🔗 " if S.norm_name(n) in bound else "") + n)[:60], f"inv:reg:{k}")] for k, n in enumerate(chunk)]
     nav = []

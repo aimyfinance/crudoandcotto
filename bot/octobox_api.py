@@ -521,14 +521,14 @@ async def fetch_day_totals(client: OdooClient, date_from: str, date_to: str, pos
     return out
 
 
-async def fetch_register_names(client: OdooClient, pos_config: str | None, days: int = 180) -> list[str]:
+async def fetch_register_names(client: OdooClient, pos_config: str | None, days: int = 90) -> list[str]:
     """Назви товарів, які каса реально пробивала за останні N днів (унікальні, за алфавітом)."""
     since = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
     domain = [["date_order", ">=", since]]
     cfgs = await client.search_read("pos.config", [["name", "=", pos_config]] if pos_config else [], ["name"], limit=10)
     if cfgs:
         domain.append(["config_id", "in", [c["id"] for c in cfgs]])
-    orders = await client.search_read("pos.order", domain, ["id"], limit=5000, order="date_order desc")
+    orders = await client.search_read("pos.order", domain, ["id"], limit=1500, order="date_order desc")
     if not orders:
         return []
     lf = await client.fields_get("pos.order.line")
