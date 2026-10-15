@@ -579,7 +579,30 @@ async def _reg_bind(msg: Message, state: FSMContext, db, reg_name: str):
         S.unmapped_set(db, row["id"], "bound")
     await state.update_data(draft=d); await state.set_state(Inv.review)
     await msg.answer(f"🔗 Каса «{reg_name}» → <b>{l['product_name']}</b>. Продажі з каси тепер списуватимуться з цього товару.")
+    if S.norm_name(reg_name) != S.norm_name(l["product_name"]):
+        taken = db.one("SELECT id FROM products WHERE lower(name)=lower(?) AND id<>?", (reg_name, l["product_id"]))
+        if not taken:
+            await msg.answer(f"Перейменувати товар у боті на касову назву «{reg_name}»? Так залишки й звіти показуватимуть те, що на касі; назва з інвойсу збережеться як прив'язка постачальника.",
+                             reply_markup=inline([[("✅ Так, перейменувати", "inv:rename:yes"), ("Залишити як є", "inv:rename:no")]]))
+            return
     await _inv_review(msg, state)
+
+
+@router.callback_query(StateFilter(Inv.review), F.data.startswith("inv:rename:"))
+async def inv_rename(cb: CallbackQuery, state: FSMContext, db):
+    data = await state.get_data(); d, i = data["draft"], data["inv_i"]; l = d["lines"][i]
+    if cb.data.endswith("yes") and l.get("reg_name"):
+        old = l["product_name"]
+        try:
+            S.update_product(db, l["product_id"], name=l["reg_name"])
+            # стара (інвойсна) назва теж лишається прив'язкою до цього товару
+            S.set_alias(db, old, l["product_id"], cb.message.chat.id)
+            l["product_name"] = l["reg_name"]
+            await state.update_data(draft=d)
+            await cb.message.answer(f"✏️ «{old}» → <b>{l['reg_name']}</b>")
+        except Exception as e:
+            await cb.message.answer(f"⚠️ Не вдалося перейменувати: {e}")
+    await cb.answer(); await _inv_review(cb.message, state)
 
 
 @router.callback_query(StateFilter(Inv.line_product), F.data.startswith("pp:iv:"))
