@@ -519,3 +519,25 @@ async def fetch_day_totals(client: OdooClient, date_from: str, date_to: str, pos
         total = sum((l["amount"] for l in r["lines"]), Decimal(0))
         e["card" if r["payment"] == "card" else "cash"] += total
     return out
+
+
+async def fetch_register_names(client: OdooClient, pos_config: str | None, days: int = 180) -> list[str]:
+    """Назви товарів, які каса реально пробивала за останні N днів (унікальні, за алфавітом)."""
+    since = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    domain = [["date_order", ">=", since]]
+    cfgs = await client.search_read("pos.config", [["name", "=", pos_config]] if pos_config else [], ["name"], limit=10)
+    if cfgs:
+        domain.append(["config_id", "in", [c["id"] for c in cfgs]])
+    orders = await client.search_read("pos.order", domain, ["id"], limit=5000, order="date_order desc")
+    if not orders:
+        return []
+    lf = await client.fields_get("pos.order.line")
+    fields = [f for f in ("full_product_name", "product_id") if f in lf]
+    names: set[str] = set()
+    ids = [o["id"] for o in orders]
+    for k in range(0, len(ids), 1000):
+        for l in await client.search_read("pos.order.line", [["order_id", "in", ids[k:k + 1000]]], fields, limit=50000):
+            n = l.get("full_product_name") or (l.get("product_id") or ["", ""])[1]
+            if n:
+                names.add(str(n).strip())
+    return sorted(names, key=str.lower)

@@ -344,6 +344,7 @@ class Inv(StatesGroup):
     file = State()
     review = State()
     line_product = State()
+    line_regname = State()
     line_weight = State()
     line_price = State()
     transport = State()
@@ -413,7 +414,8 @@ def _line_text(i: int, l: dict) -> str:
     pr = f"{fmt_price(l['price'])} €/кг" if l["price"] else "— €/кг"
     amt = fmt_money(l["amount"]) if l["amount"] else "—"
     iss = f" ⚠️ {'; '.join(l['issues'])}" if l["issues"] and not l.get("skip") else ""
-    return f"{mark} {i + 1}. {l['description'][:40]} → <b>{l['product_name'] or 'не знайдено'}</b>\n     {w} × {pr} = {amt}{iss}"
+    reg = f"\n     🧾 каса: {l['reg_name']}" if l.get("reg_name") else ""
+    return f"{mark} {i + 1}. {l['description'][:40]} → <b>{l['product_name'] or 'не знайдено'}</b>\n     {w} × {pr} = {amt}{iss}{reg}"
 
 
 async def _inv_review(msg: Message, state: FSMContext):
@@ -443,6 +445,7 @@ async def inv_line(cb: CallbackQuery, state: FSMContext):
     await cb.message.answer(_line_text(i, l), reply_markup=inline([
         [("🧀 Товар", f"inv:edit:product"), ("⚖️ Вага", f"inv:edit:weight"), ("💶 Ціна/кг", f"inv:edit:price")],
         [("▶️ Пропустити позицію" if not l.get("skip") else "↩️ Повернути позицію", "inv:edit:skip"), ("➕ Створити товар", "inv:edit:new")],
+        [("🧾 Назва в касі (прив'язати)", "inv:edit:reg")],
     ]))
     await cb.answer()
 
@@ -462,6 +465,12 @@ async def inv_edit(cb: CallbackQuery, state: FSMContext, db, user):
     elif what == "price":
         await state.set_state(Inv.line_price)
         await cb.message.answer("Ціна за кг, €:", reply_markup=nav_kb(back=False))
+    elif what == "reg":
+        if not d["lines"][i]["product_id"]:
+            await cb.answer("Спочатку оберіть товар бота (🧀 Товар або ➕ Створити)", show_alert=True); return
+        await state.set_state(Inv.line_regname); await state.update_data(reg_page=0, reg_q="")
+        await cb.message.answer("⏳ Беру список назв із каси…")
+        await _reg_show(cb.message, state, db)
     elif what == "skip":
         d["lines"][i]["skip"] = not d["lines"][i].get("skip")
         await state.update_data(draft=d)
@@ -474,12 +483,103 @@ async def inv_edit(cb: CallbackQuery, state: FSMContext, db, user):
             cat = "cheese"
         if any(k in low for k in ("gnocchi", "ravioli", "tortell", "pasta", "cappell")):
             cat = "pasta"
-        pid = S.create_product(db, l["description"][:80].title(), cat, "weight", Decimal(0))
-        l["product_id"], l["product_name"], l["how"] = pid, S.get_product(db, pid)["name"], "exact"
-        await state.update_data(draft=d)
-        await cb.message.answer(f"✅ Створено товар «{l['product_name']}» ({S.CATEGORIES[cat]}, на вагу, роздрібна ціна 0 — задайте в «Товари»).")
+        name = l["description"][:80].strip()
+        name = name.title() if name.isupper() else name
+        exist = db.one("SELECT * FROM products WHERE lower(name)=lower(?)", (name,))
+        if exist:
+            if not exist["active"]:
+                S.update_product(db, exist["id"], active=1)
+            l["product_id"], l["product_name"], l["how"] = exist["id"], exist["name"], "exact"
+            await state.update_data(draft=d)
+            await cb.message.answer(f"ℹ️ Товар «{exist['name']}» уже є — прив'язав до нього.")
+        else:
+            pid = S.create_product(db, name, cat, "weight", Decimal(0))
+            l["product_id"], l["product_name"], l["how"] = pid, S.get_product(db, pid)["name"], "exact"
+            await state.update_data(draft=d)
+            await cb.message.answer(f"✅ Створено товар «{l['product_name']}» ({S.CATEGORIES[cat]}, на вагу, роздрібна ціна 0 — задайте в «Товари»).")
         await _inv_review(cb.message, state)
     await cb.answer()
+
+
+async def _reg_show(msg: Message, state: FSMContext, db):
+    from .octobox import register_names
+    data = await state.get_data()
+    d, i = data["draft"], data["inv_i"]
+    names = await register_names()
+    q = (data.get("reg_q") or "").lower().strip()
+    if q:
+        names = [n for n in names if q in n.lower()]
+    else:
+        # спочатку найсхожіші на назву з інвойсу
+        from ..services import _tokens
+        toks = set(_tokens(d["lines"][i]["description"]))
+        names.sort(key=lambda n: -len(toks & set(_tokens(n))))
+    bound = {r["alias"]: r["product_name"] for r in S.list_aliases(db)}
+    page = data.get("reg_page", 0); per = 8
+    chunk = names[page * per:(page + 1) * per]
+    await state.update_data(reg_names=chunk)
+    if not names:
+        await msg.answer("Список назв каси порожній — Octobox недоступний або нічого не продавалось. Введіть назву вручну текстом.", reply_markup=nav_kb(back=False))
+        return
+    kb = [[((("🔗 " if S.norm_name(n) in bound else "") + n)[:60], f"inv:reg:{k}")] for k, n in enumerate(chunk)]
+    nav = []
+    if page > 0: nav.append(("⬅️", "inv:regpg:prev"))
+    if (page + 1) * per < len(names): nav.append(("➡️", "inv:regpg:next"))
+    if nav: kb.append(nav)
+    kb.append([("◀️ Назад до позиції", "inv:regback")])
+    await msg.answer(f"Яка назва в касі відповідає «{d['lines'][i]['description'][:50]}» → <b>{d['lines'][i]['product_name']}</b>?\n"
+                     f"Оберіть зі списку ({len(names)}) або надішліть частину назви для пошуку. 🔗 — уже прив'язано до іншого товару.",
+                     reply_markup=inline(kb))
+
+
+@router.callback_query(StateFilter(Inv.line_regname), F.data.startswith("inv:regpg:"))
+async def inv_reg_page(cb: CallbackQuery, state: FSMContext, db):
+    data = await state.get_data(); page = data.get("reg_page", 0)
+    await state.update_data(reg_page=max(0, page + (1 if cb.data.endswith("next") else -1)))
+    await cb.answer(); await _reg_show(cb.message, state, db)
+
+
+@router.callback_query(StateFilter(Inv.line_regname), F.data == "inv:regback")
+async def inv_reg_back(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(Inv.review); await cb.answer(); await _inv_review(cb.message, state)
+
+
+@router.message(StateFilter(Inv.line_regname), F.text)
+async def inv_reg_search(msg: Message, state: FSMContext, db):
+    if msg.text == BACK:
+        await state.set_state(Inv.review); return await _inv_review(msg, state)
+    await state.update_data(reg_q=msg.text.strip(), reg_page=0)
+    data = await state.get_data()
+    from .octobox import register_names
+    names = await register_names()
+    if not any(msg.text.strip().lower() in n.lower() for n in names):
+        # нема в списку — прив'язуємо введену назву як є
+        return await _reg_bind(msg, state, db, msg.text.strip())
+    await _reg_show(msg, state, db)
+
+
+@router.callback_query(StateFilter(Inv.line_regname), F.data.startswith("inv:reg:"))
+async def inv_reg_pick(cb: CallbackQuery, state: FSMContext, db):
+    k = int(cb.data.split(":")[2]); data = await state.get_data()
+    names = data.get("reg_names") or []
+    if k >= len(names):
+        return await cb.answer("Список застарів", show_alert=True)
+    await cb.answer()
+    await _reg_bind(cb.message, state, db, names[k])
+
+
+async def _reg_bind(msg: Message, state: FSMContext, db, reg_name: str):
+    data = await state.get_data()
+    d, i = data["draft"], data["inv_i"]
+    l = d["lines"][i]
+    S.set_alias(db, reg_name, l["product_id"], msg.chat.id)
+    l["reg_name"] = reg_name
+    row = db.one("SELECT id FROM pos_unmapped WHERE name=? AND status='open'", (reg_name,))
+    if row:
+        S.unmapped_set(db, row["id"], "bound")
+    await state.update_data(draft=d); await state.set_state(Inv.review)
+    await msg.answer(f"🔗 Каса «{reg_name}» → <b>{l['product_name']}</b>. Продажі з каси тепер списуватимуться з цього товару.")
+    await _inv_review(msg, state)
 
 
 @router.callback_query(StateFilter(Inv.line_product), F.data.startswith("pp:iv:"))

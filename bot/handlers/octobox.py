@@ -136,6 +136,31 @@ def unmapped_prompt(db, row) -> tuple[str, list]:
     return text, kb
 
 
+async def register_names(force: bool = False) -> list[str]:
+    """Назви товарів каси з кешем на добу (app_settings.register_names)."""
+    import json
+    from ..octobox_api import fetch_register_names
+    db = get_db()
+    cached = S.setting_get(db, "register_names")
+    ts = S.setting_get(db, "register_names_at")
+    if cached and not force and ts and (dt.datetime.now(TZ) - dt.datetime.fromisoformat(ts)).total_seconds() < 86400:
+        return json.loads(cached)
+    cl = _client()
+    names: list[str] = json.loads(cached) if cached else []
+    if cl:
+        try:
+            async with cl as c:
+                await c.authenticate()
+                names = await fetch_register_names(c, config()["pos_config"])
+            S.setting_set(db, "register_names", json.dumps(names, ensure_ascii=False))
+            S.setting_set(db, "register_names_at", dt.datetime.now(TZ).isoformat())
+        except Exception as e:
+            log.warning("register_names: %s", e)
+    # + назви, які вже бачили у чеках, але ще не прив'язані
+    extra = [r["name"] for r in S.unmapped_open(db)]
+    return sorted(set(names) | set(extra), key=str.lower)
+
+
 async def _notify(bot: Bot, db, text: str, admins_only: bool = False) -> None:
     for uid in S.notify_targets(db, "admin" if admins_only else "manager"):
         try:

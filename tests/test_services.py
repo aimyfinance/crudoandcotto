@@ -291,3 +291,18 @@ def test_archived_product_not_matched(db):
     assert S.match_product(db, "Taleggio") == (p_dop, "alias")
     S.delete_alias(db, "Taleggio")
     assert S.match_product(db, "Taleggio")[1] != "alias"
+
+
+def test_fetch_register_names():
+    import asyncio
+    from bot.octobox_api import fetch_register_names
+
+    class FakeClient:
+        async def search_read(self, model, domain, fields, limit=200, order=None):
+            if model == "pos.config": return [{"id": 1, "name": "K01"}]
+            if model == "pos.order": return [{"id": 1}, {"id": 2}]
+            return [{"full_product_name": "Prosciutto di Parma", "product_id": [1, "Prosciutto di Parma"]},
+                    {"full_product_name": None, "product_id": [2, "Golfetta"]},
+                    {"full_product_name": "Prosciutto di Parma", "product_id": [1, "Prosciutto di Parma"]}]
+        async def fields_get(self, m): return {"full_product_name": {}, "product_id": {}}
+    assert asyncio.run(fetch_register_names(FakeClient(), "K01")) == ["Golfetta", "Prosciutto di Parma"]
