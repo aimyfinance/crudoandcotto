@@ -289,8 +289,14 @@ def sales_summary_text(db, d1: str, d2: str) -> str:
     if 1 < len(days) <= 31:
         out.append("\n<b>По днях</b>")
         out.append("<pre>" + "\n".join(f"{ua_date(r['sale_date'])[:5]}  {fmt_money(Decimal(str(r['t']))):>11}  {r['n']:>3} чек." for r in days) + "</pre>")
-    out.append("<b>Топ товарів</b> — кг · виручка · маржа")
-    out.append(table_products(rep["by_product"][:10]))
+    out.append("<b>По товарах</b> — кг · виручка · маржа")
+    out.append(table_products(rep["by_product"][:25]))
+    rest = rep["by_product"][25:]
+    if rest:
+        out.append(f"…і ще {len(rest)} поз. на {fmt_money(sum((e['amount'] for e in rest), Decimal(0)))}")
+    zero = [e["name"] for e in rep["by_product"] if e["margin_pct"] >= 99.5 and e["amount"] > 0]
+    if zero:
+        out.append("⚠️ Без собівартості (маржа 100 %) — не внесено закупівлю: " + ", ".join(zero))
     return "\n".join(out)
 
 
