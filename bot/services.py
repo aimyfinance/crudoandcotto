@@ -660,6 +660,30 @@ def list_aliases(db: Database):
     return db.q("SELECT a.*, p.name AS product_name, p.active AS product_active FROM product_aliases a JOIN products p ON p.id=a.product_id ORDER BY a.alias_raw")
 
 
+def merge_products(db: Database, src_id: int, dst_id: int, user_id: int) -> dict:
+    """Злити товар src у dst: партії, продажі, списання, прив'язки переходять на dst; src — в архів з позначкою."""
+    if src_id == dst_id:
+        raise ValueError("Це той самий товар")
+    with db.tx() as c:
+        src = c.execute("SELECT * FROM products WHERE id=?", (src_id,)).fetchone()
+        dst = c.execute("SELECT * FROM products WHERE id=?", (dst_id,)).fetchone()
+        if not src or not dst:
+            raise ValueError("Товар не знайдено")
+        n = {}
+        for t in ("batches", "sale_lines", "writeoffs", "stock_movements", "purchase_lines", "pos_unmapped"):
+            try:
+                n[t] = c.execute(f"UPDATE {t} SET product_id=? WHERE product_id=?", (dst_id, src_id)).rowcount
+            except Exception:
+                n[t] = 0
+        c.execute("UPDATE product_aliases SET product_id=? WHERE product_id=?", (dst_id, src_id))
+        # стара назва теж веде на dst
+        c.execute("INSERT OR IGNORE INTO product_aliases(alias, alias_raw, product_id, created_by, created_at) VALUES (?,?,?,?,?)",
+                  (norm_name(src["name"]), src["name"], dst_id, user_id, now_utc()))
+        c.execute("UPDATE products SET active=0, name=?, updated_at=? WHERE id=?", (f"{src['name']} (злито #{dst_id})", now_utc(), src_id))
+        audit(c, user_id, "product.merge", {"src": src_id, "dst": dst_id, **n})
+    return n
+
+
 def suggest_products(db: Database, raw: str, n: int = 3) -> list[tuple[int, str, float]]:
     """Кандидати на прив'язку за схожістю назв (навіть слабкі) — для кнопок «це той товар?»."""
     rt = _tokens(raw)

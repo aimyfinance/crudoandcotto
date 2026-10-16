@@ -306,3 +306,17 @@ def test_fetch_register_names():
                     {"full_product_name": "Prosciutto di Parma", "product_id": [1, "Prosciutto di Parma"]}]
         async def fields_get(self, m): return {"full_product_name": {}, "product_id": {}}
     assert asyncio.run(fetch_register_names(FakeClient(), "K01")) == ["Golfetta", "Prosciutto di Parma"]
+
+
+def test_merge_products(db):
+    from decimal import Decimal
+    a = S.create_product(db, "Büffelmozzarella Gnocchi", "pasta", "weight", Decimal("28"))
+    b = S.create_product(db, "Gefüllte Gnocchi", "pasta", "weight", Decimal("28"))
+    S.add_opening_stock(db, 1, a, 5000, Decimal("14"), None, "2026-10-10", "x")
+    S.add_opening_stock(db, 1, b, 700, Decimal("14"), None, "2026-10-12", "y")
+    S.set_alias(db, "Gefüllte Gnocchi", b, 1)
+    n = S.merge_products(db, b, a, 1)
+    S.update_product(db, a, name="Gefüllte Gnocchi")
+    assert n["batches"] == 1 and S.stock_of_product(db, a) == 5700
+    assert S.match_product(db, "Gefüllte Gnocchi")[0] == a
+    assert not S.get_product(db, b)["active"] and S.stock_of_product(db, b) == 0

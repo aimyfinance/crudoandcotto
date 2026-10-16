@@ -532,7 +532,16 @@ async def prod_edit_value(msg: Message, state: FSMContext, db, user):
         if f == "price":
             S.update_product(db, pid, retail_price=parse_money(msg.text))
         elif f == "name":
-            S.update_product(db, pid, name=msg.text.strip()[:80])
+            new = msg.text.strip()[:80]
+            other = db.one("SELECT * FROM products WHERE lower(name)=lower(?) AND id<>?", (new, pid))
+            if other:
+                await state.update_data(merge_other=other["id"])
+                st = S.stock_of_product(db, other["id"])
+                return await msg.answer(
+                    f"Товар «{other['name']}» уже є ({'архів, ' if not other['active'] else ''}залишок {fmt_grams(st)}). Об'єднати? "
+                    f"Партії, продажі та прив'язки «{other['name']}» перейдуть у поточний товар, а він отримає цю назву.",
+                    reply_markup=inline([[("🔀 Так, об'єднати", "pmerge:yes"), ("Ні", "pmerge:no")]]))
+            S.update_product(db, pid, name=new)
         elif f == "pg":
             if not msg.text.strip().isdigit():
                 raise ParseError("Ціле число грамів")
@@ -547,3 +556,19 @@ async def prod_edit_value(msg: Message, state: FSMContext, db, user):
         return await msg.answer(f"⚠️ Не вдалося зберегти: {e}")
     await state.clear()
     await msg.answer("✅ Збережено.\n" + product_card(S.get_product(db, pid)), reply_markup=menu_for(user))
+
+
+@router.callback_query(F.data.startswith("pmerge:"))
+async def prod_merge(cb: CallbackQuery, state: FSMContext, db, user):
+    data = await state.get_data()
+    pid, other = data.get("edit_pid"), data.get("merge_other")
+    if cb.data.endswith("no") or not pid or not other:
+        await state.clear(); await cb.answer(); return await cb.message.answer("Скасовано.", reply_markup=menu_for(user))
+    o = S.get_product(db, other); name = o["name"]
+    try:
+        n = S.merge_products(db, other, pid, user["telegram_id"])
+        S.update_product(db, pid, name=name)
+    except Exception as e:
+        await cb.answer(); return await cb.message.answer(f"⚠️ {e}")
+    await state.clear(); await cb.answer("Об'єднано")
+    await cb.message.answer(f"🔀 Об'єднано: партій перенесено {n.get('batches', 0)}, продажів {n.get('sale_lines', 0)}.\n" + product_card(S.get_product(db, pid)), reply_markup=menu_for(user))
