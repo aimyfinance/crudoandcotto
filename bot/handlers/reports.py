@@ -116,6 +116,8 @@ def table_products(rows, with_margin=True) -> str:
         line = f"{_sh(e['name']):<18} {_kg(e['grams']):>6} {float(e['amount']):>7.0f}€"
         if with_margin:
             line += f" {float(e['margin_pct']):>3.0f}%"
+        if e.get("issues"):
+            line += " 🔴"
         out.append(line)
     return "<pre>" + "\n".join(out) + "</pre>"
 
@@ -294,9 +296,10 @@ def sales_summary_text(db, d1: str, d2: str) -> str:
     rest = rep["by_product"][25:]
     if rest:
         out.append(f"…і ще {len(rest)} поз. на {fmt_money(sum((e['amount'] for e in rest), Decimal(0)))}")
-    zero = [e["name"] for e in rep["by_product"] if e["margin_pct"] >= 99.5 and e["amount"] > 0]
-    if zero:
-        out.append("⚠️ Без собівартості (маржа 100 %) — не внесено закупівлю: " + ", ".join(zero))
+    bad = [e for e in rep["by_product"] if e.get("issues")]
+    if bad:
+        out.append("🔴 <b>Потребують уваги</b>:\n" + "\n".join(f"• {e['name']}: {', '.join(e['issues'])}" for e in bad)
+                   + "\n<i>без собівартості / продано без залишку → внесіть закупівлю; залишок 0 → перевірте, чи товар справді закінчився</i>")
     return "\n".join(out)
 
 

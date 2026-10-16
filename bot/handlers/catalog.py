@@ -36,6 +36,7 @@ def stock_text(db) -> str:
     out = []
     total = Decimal(0)
     by_cat: dict[str, list] = {}
+    zero_cost: list[str] = []
     for r in rows:
         by_cat.setdefault(r["product"]["category"], []).append(r)
         total += r["cost_value"]
@@ -53,9 +54,13 @@ def stock_text(db) -> str:
             else:
                 qty = f"{r['grams'] / 1000:>5.2f}".replace(".", ",") + " кг" if r["grams"] >= 1000 else f"{r['grams']:>5} г "
             flag = "⏰" if r["nearest_expiry"] and r["nearest_expiry"] <= (dt.date.today() + dt.timedelta(days=7)).isoformat() else " "
+            if r["grams"] > 0 and r["cost_value"] == 0:
+                flag = "🔴"; zero_cost.append(p["name"])
             lines.append(f"{_short(p['name']):<18} {qty:>8} {float(r['cost_value']):>7.0f}€{flag}")
         out.append("<pre>" + "\n".join(lines) + "</pre>")
     out.append(f"Разом: <b>{fmt_grams(sum(r['grams'] for r in rows))}</b> на <b>{fmt_money(total)}</b> (закупівельна)")
+    if zero_cost:
+        out.append("🔴 Партії без ціни (закупівлю не внесено): " + ", ".join(zero_cost))
     return "\n".join(out)
 
 

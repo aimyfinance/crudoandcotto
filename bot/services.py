@@ -917,9 +917,19 @@ def report_period(db: Database, date_from: str, date_to: str) -> dict:
             e["pieces"] += l["pieces"] or 0
             e["amount"] += d(l["amount"])
             e["cost"] += d(l["cost"])
-    for e in by_product.values():
+    for pid, e in by_product.items():
         e["gross_profit"] = e["amount"] - e["cost"]
         e["margin_pct"] = (e["gross_profit"] / e["amount"] * 100) if e["amount"] else ZERO
+        e["product_id"] = pid
+        issues = []
+        if e["amount"] > 0 and e["cost"] == 0:
+            issues.append("без собівартості")
+        if db.one("SELECT 1 FROM batches WHERE product_id=? AND comment LIKE 'продано за касою%' AND comment NOT LIKE '%[зараховано%' AND received_at BETWEEN ? AND ?",
+                  (pid, f"{d1}T00:00:00+00:00", f"{d2}T23:59:59+00:00")):
+            issues.append("продано без залишку")
+        if stock_of_product(db, pid) <= 0:
+            issues.append("залишок 0")
+        e["issues"] = issues
 
     purchases = db.q(
         "SELECT pl.grams, pl.amount, pu.extra_costs, pu.id AS pid FROM purchase_lines pl JOIN purchases pu ON pu.id=pl.purchase_id "
