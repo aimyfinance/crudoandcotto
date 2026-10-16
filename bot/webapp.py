@@ -104,7 +104,7 @@ def _today(db, user=None):
         "sales_count": rep["sales_count"], "sold_grams": rep["sold_grams"],
         "by_payment": {k: str(v) for k, v in rep["by_payment"].items()},
         "top": [{"name": e["name"], "amount": str(e["amount"]), "grams": e["grams"], "margin": float(e["margin_pct"])}
-                for e in rep["by_product"][:8]],
+                for e in rep["by_product"]],
         "sales": sales,
         "stock_value": str(rep["stock_value"]), "stock_grams": rep["stock_grams"],
     }
