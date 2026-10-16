@@ -925,7 +925,7 @@ def report_period(db: Database, date_from: str, date_to: str) -> dict:
         if e["amount"] > 0 and e["cost"] == 0:
             issues.append("без собівартості")
         if db.one("SELECT 1 FROM batches WHERE product_id=? AND comment LIKE 'продано за касою%' AND comment NOT LIKE '%[зараховано%' AND received_at BETWEEN ? AND ?",
-                  (pid, f"{d1}T00:00:00+00:00", f"{d2}T23:59:59+00:00")):
+                  (pid, f"{date_from}T00:00:00+00:00", f"{date_to}T23:59:59+00:00")):
             issues.append("продано без залишку")
         if stock_of_product(db, pid) <= 0:
             issues.append("залишок 0")
